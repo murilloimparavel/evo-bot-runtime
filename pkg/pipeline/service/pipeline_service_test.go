@@ -61,11 +61,11 @@ type mockDebounce struct {
 func (m *mockDebounce) GetAttachments(_ context.Context, _, _ int64) ([]model.Attachment, error) {
 	return nil, nil
 }
-func (m *mockDebounce) Start(_ context.Context, _, _ int64, _ string, _ []model.Attachment, _ model.BotConfig) error {
+func (m *mockDebounce) Start(_ context.Context, _, _ int64, _, _ string, _ []model.Attachment, _ model.BotConfig) error {
 	m.startCalled = true
 	return m.startErr
 }
-func (m *mockDebounce) Reset(_ context.Context, _, _ int64, _ string, _ []model.Attachment, _ model.BotConfig) error {
+func (m *mockDebounce) Reset(_ context.Context, _, _ int64, _, _ string, _ []model.Attachment, _ model.BotConfig) error {
 	m.resetCalled = true
 	return nil
 }
@@ -500,6 +500,7 @@ func TestAIStage_Success_AdvancesToDispatch(t *testing.T) {
 	event := &model.MessageEvent{
 		ContactID: 90, ConversationID: 90,
 		MessageContent: "test message",
+		MessageID:      "crm-message-90",
 		BotConfig:      model.BotConfig{DebounceTime: 0},
 	}
 	if err := svc.Process(ctx, event); err != nil {
@@ -513,6 +514,99 @@ func TestAIStage_Success_AdvancesToDispatch(t *testing.T) {
 	}
 	if state == nil || state.Stage != model.StageDispatch {
 		t.Errorf("state.Stage = %v, want StageDispatch after successful AI call", state)
+	}
+}
+
+func TestAIStage_AppendsResponseNoticeToSingleAgentDispatch(t *testing.T) {
+	dispatched := make(chan string, 1)
+	var aiMessage string
+	mock := &mockAIAdapter{
+		callFn: func(_ context.Context, req *aiModel.A2ARequest) (*aiModel.NormalizedResponse, error) {
+			aiMessage = req.Message
+			return &aiModel.NormalizedResponse{Content: "Encontrei opções para sua reserva."}, nil
+		},
+	}
+	dispatch := &mockDispatchEngine{
+		dispatchFn: func(_ context.Context, _, _ int64, content string, _ model.BotConfig, _ string) error {
+			dispatched <- content
+			return nil
+		},
+	}
+	svc, _ := setupSvcWithAIAndDispatch(t, mock, dispatch)
+	notice := "Observação: não consegui processar o áudio porque ele tem mais de 4 minutos."
+	event := &model.MessageEvent{
+		ContactID: 99091, ConversationID: 99091, MessageID: "crm-message-99091",
+		MessageContent: "Quero reservar", ResponseNotice: notice,
+		BotConfig: model.BotConfig{DebounceTime: 0},
+	}
+
+	if err := svc.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process returned error: %v", err)
+	}
+
+	select {
+	case got := <-dispatched:
+		want := "Encontrei opções para sua reserva.\n\n" + notice
+		if got != want {
+			t.Errorf("dispatch content = %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AI response was not dispatched")
+	}
+	if aiMessage != "Quero reservar" {
+		t.Errorf("AI received %q; response notice must stay out of user input", aiMessage)
+	}
+}
+
+func TestResetDebouncePersistsAndDeduplicatesResponseNotice(t *testing.T) {
+	svc, _ := setupSvcFull(t)
+	ctx := context.Background()
+	firstNotice := "O áudio é longo demais."
+	event := &model.MessageEvent{
+		ContactID: 99092, ConversationID: 99092, MessageID: "first",
+		MessageContent: "Primeira parte", ResponseNotice: firstNotice,
+		BotConfig: model.BotConfig{DebounceTime: 60},
+	}
+	if err := svc.Process(ctx, event); err != nil {
+		t.Fatalf("first Process returned error: %v", err)
+	}
+
+	secondNotice := &model.MessageEvent{
+		ContactID: 99092, ConversationID: 99092, MessageID: "second",
+		MessageContent: "Segunda parte", ResponseNotice: firstNotice,
+		BotConfig: model.BotConfig{DebounceTime: 60},
+	}
+	if err := svc.Process(ctx, secondNotice); err != nil {
+		t.Fatalf("second Process returned error: %v", err)
+	}
+
+	state, err := svc.repo.GetState(ctx, 99092, 99092)
+	if err != nil {
+		t.Fatalf("GetState returned error: %v", err)
+	}
+	if state.ResponseNotice != firstNotice {
+		t.Errorf("persisted response notice = %q, want exactly one %q", state.ResponseNotice, firstNotice)
+	}
+	value, ok := svc.entries.Load(pairKey(99092, 99092))
+	if !ok || value.(pipelineEntry).responseNotice != firstNotice {
+		t.Errorf("in-memory debounce entry did not retain the deduplicated notice: %#v", value)
+	}
+}
+
+func TestStart_RecoveryCreatesStableLegacyIdempotencyKey(t *testing.T) {
+	svc, _ := setupSvcFull(t)
+	ctx := context.Background()
+	_ = svc.repo.SetState(ctx, 99809, 99809, &model.PipelineState{Stage: model.StageDebounce, CreatedAt: time.Now()})
+
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	state, err := svc.repo.GetState(ctx, 99809, 99809)
+	if err != nil {
+		t.Fatalf("GetState: %v", err)
+	}
+	if state == nil || state.Stage != model.StageAI || !strings.HasPrefix(state.MessageID, "debounce:") {
+		t.Fatalf("legacy recovery should advance with deterministic idempotency key, got %+v", state)
 	}
 }
 

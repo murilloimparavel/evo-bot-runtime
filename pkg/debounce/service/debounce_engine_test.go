@@ -49,7 +49,7 @@ func TestStart_SetsTTLAndBuffer(t *testing.T) {
 	ctx := context.Background()
 	cfg := model.BotConfig{DebounceTime: 5}
 
-	if err := eng.Start(ctx, 1, 1, "first message", nil, cfg); err != nil {
+	if err := eng.Start(ctx, 1, 1, "first message", "msg-1", nil, cfg); err != nil {
 		t.Fatalf("Start returned error: %v", err)
 	}
 
@@ -69,7 +69,7 @@ func TestStart_ZeroDuration_SetsNoTimer(t *testing.T) {
 	ctx := context.Background()
 	cfg := model.BotConfig{DebounceTime: 0}
 
-	if err := eng.Start(ctx, 2, 2, "immediate", nil, cfg); err != nil {
+	if err := eng.Start(ctx, 2, 2, "immediate", "msg-2", nil, cfg); err != nil {
 		t.Fatalf("Start returned error: %v", err)
 	}
 
@@ -84,14 +84,14 @@ func TestReset_RefreshesTTLAndAppendsBuffer(t *testing.T) {
 	ctx := context.Background()
 	cfg := model.BotConfig{DebounceTime: 10}
 
-	if err := eng.Start(ctx, 3, 3, "msg1", nil, cfg); err != nil {
+	if err := eng.Start(ctx, 3, 3, "msg1", "msg-3a", nil, cfg); err != nil {
 		t.Fatalf("Start returned error: %v", err)
 	}
 
 	// Simulate time passing by setting a shorter TTL manually
 	rdb.Expire(ctx, "bot_runtime:timer:3:3", 2*time.Second)
 
-	if err := eng.Reset(ctx, 3, 3, "msg2", nil, cfg); err != nil {
+	if err := eng.Reset(ctx, 3, 3, "msg2", "msg-3b", nil, cfg); err != nil {
 		t.Fatalf("Reset returned error: %v", err)
 	}
 
@@ -111,9 +111,9 @@ func TestGetBuffer_ConcatenatesWithDoubleNewline(t *testing.T) {
 	ctx := context.Background()
 	cfg := model.BotConfig{DebounceTime: 5}
 
-	_ = eng.Start(ctx, 4, 4, "hello", nil, cfg)
-	_ = eng.Reset(ctx, 4, 4, "world", nil, cfg)
-	_ = eng.Reset(ctx, 4, 4, "again", nil, cfg)
+	_ = eng.Start(ctx, 4, 4, "hello", "msg-4a", nil, cfg)
+	_ = eng.Reset(ctx, 4, 4, "world", "msg-4b", nil, cfg)
+	_ = eng.Reset(ctx, 4, 4, "again", "msg-4c", nil, cfg)
 
 	result, err := eng.GetBuffer(ctx, 4, 4)
 	if err != nil {
@@ -130,7 +130,7 @@ func TestTimerExists_ReturnsFalseAfterExpiry(t *testing.T) {
 	ctx := context.Background()
 	cfg := model.BotConfig{DebounceTime: 1} // 1 second TTL
 
-	if err := eng.Start(ctx, 5, 5, "msg", nil, cfg); err != nil {
+	if err := eng.Start(ctx, 5, 5, "msg", "msg-5", nil, cfg); err != nil {
 		t.Fatalf("Start returned error: %v", err)
 	}
 
