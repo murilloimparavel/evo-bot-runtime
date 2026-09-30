@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -54,6 +55,7 @@ func (r *redisPipelineRepository) ClearState(ctx context.Context, contactID, con
 	keys := []string{
 		stateKey(contactID, conversationID),
 		bufferKey(contactID, conversationID),
+		messageIDsKey(contactID, conversationID),
 		attachBufferKey(contactID, conversationID), // EVO-2180: clear media with the text buffer
 		timerKey(contactID, conversationID),
 	}
@@ -66,6 +68,26 @@ func (r *redisPipelineRepository) AppendToBuffer(ctx context.Context, contactID,
 
 func (r *redisPipelineRepository) GetBuffer(ctx context.Context, contactID, conversationID int64) ([]string, error) {
 	return r.rdb.LRange(ctx, bufferKey(contactID, conversationID), 0, -1).Result()
+}
+
+func (r *redisPipelineRepository) AppendMessageID(ctx context.Context, contactID, conversationID int64, messageID string) error {
+	if messageID == "" {
+		return nil
+	}
+	key := messageIDsKey(contactID, conversationID)
+	if err := r.rdb.SAdd(ctx, key, messageID).Err(); err != nil {
+		return err
+	}
+	return r.rdb.Expire(ctx, key, attachBufferTTL).Err()
+}
+
+func (r *redisPipelineRepository) GetMessageIDs(ctx context.Context, contactID, conversationID int64) ([]string, error) {
+	ids, err := r.rdb.SMembers(ctx, messageIDsKey(contactID, conversationID)).Result()
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 // AppendAttachments RPushes each attachment (JSON-encoded) onto the media buffer,
@@ -178,6 +200,10 @@ func stateKey(contactID, conversationID int64) string {
 
 func bufferKey(contactID, conversationID int64) string {
 	return fmt.Sprintf("bot_runtime:buffer:%d:%d", contactID, conversationID)
+}
+
+func messageIDsKey(contactID, conversationID int64) string {
+	return fmt.Sprintf("bot_runtime:message_ids:%d:%d", contactID, conversationID)
 }
 
 // attachBufferTTL outlives any turn but stays under the 15-minute TTL the CRM signs

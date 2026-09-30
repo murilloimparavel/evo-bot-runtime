@@ -123,6 +123,33 @@ func TestAppendToBuffer_PreservesOrder(t *testing.T) {
 	}
 }
 
+func TestMessageIDs_AreUniqueSortedAndClearedWithPipelineState(t *testing.T) {
+	repo, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const contactID, conversationID int64 = 9871, 9872
+	for _, id := range []string{"message-b", "message-a", "message-b"} {
+		if err := repo.AppendMessageID(ctx, contactID, conversationID, id); err != nil {
+			t.Fatalf("AppendMessageID(%q): %v", id, err)
+		}
+	}
+	got, err := repo.GetMessageIDs(ctx, contactID, conversationID)
+	if err != nil {
+		t.Fatalf("GetMessageIDs: %v", err)
+	}
+	if len(got) != 2 || got[0] != "message-a" || got[1] != "message-b" {
+		t.Fatalf("GetMessageIDs = %v, want unique sorted IDs", got)
+	}
+	if err := repo.ClearState(ctx, contactID, conversationID); err != nil {
+		t.Fatalf("ClearState: %v", err)
+	}
+	got, err = repo.GetMessageIDs(ctx, contactID, conversationID)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("GetMessageIDs after ClearState = %v (err %v), want empty", got, err)
+	}
+}
+
 func TestGetBuffer_EmptyKey_ReturnsEmpty(t *testing.T) {
 	repo, cleanup := setupTestRepo(t)
 	defer cleanup()

@@ -8,10 +8,19 @@ on:
   pull_request:
   push:
     branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       redis:
         image: redis:7-alpine
@@ -24,9 +33,9 @@ jobs:
     env:
       REDIS_TEST_URL: redis://localhost:6379
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -38,4 +47,6 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ./...
+        # All Redis-backed packages use isolated logical DBs, but several unit
+        # packages share DB 15; serialize packages to avoid cross-package flushes.
+        run: go test -p 1 ./...

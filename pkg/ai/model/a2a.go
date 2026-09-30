@@ -6,6 +6,7 @@ type A2ARequest struct {
 	OutgoingURL    string         // full A2A endpoint URL from agent_bot.outgoing_url
 	ContactID      int64          // used for userId in JSON-RPC params
 	ConversationID int64          // used for contextId in JSON-RPC params
+	MessageID      string         // stable CRM message ID used for retry idempotency
 	ApiKey         string         // used for X-API-Key header (per-event auth)
 	Message        string         // aggregated buffer content (FR-15)
 	Metadata       map[string]any // CRM metadata passed through to processor (tools context)
@@ -36,8 +37,9 @@ type JSONRPCParams struct {
 }
 
 type JSONRPCMessage struct {
-	Role  string        `json:"role"`
-	Parts []JSONRPCPart `json:"parts"`
+	Role      string        `json:"role"`
+	Parts     []JSONRPCPart `json:"parts"`
+	MessageID string        `json:"messageId,omitempty"`
 }
 
 type JSONRPCPart struct {

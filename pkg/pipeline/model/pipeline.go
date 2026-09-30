@@ -27,14 +27,16 @@ type PairID struct {
 // BotConfig and PostbackURL are persisted for StageDebounce so that the service can
 // reconstruct the pipelineEntry correctly after a restart (NFR-01 recovery).
 type PipelineState struct {
-	Stage       Stage          `json:"stage"`
-	CreatedAt   time.Time      `json:"created_at"`
-	BotConfig   BotConfig      `json:"bot_config,omitempty"`
-	PostbackURL string         `json:"postback_url,omitempty"`
-	AgentBotID  string         `json:"agent_bot_id,omitempty"`
-	ApiKey      string         `json:"api_key,omitempty"`
-	OutgoingURL string         `json:"outgoing_url,omitempty"`
-	Metadata    map[string]any `json:"metadata,omitempty"`
+	Stage          Stage          `json:"stage"`
+	CreatedAt      time.Time      `json:"created_at"`
+	BotConfig      BotConfig      `json:"bot_config,omitempty"`
+	PostbackURL    string         `json:"postback_url,omitempty"`
+	AgentBotID     string         `json:"agent_bot_id,omitempty"`
+	ApiKey         string         `json:"api_key,omitempty"`
+	OutgoingURL    string         `json:"outgoing_url,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
+	MessageID      string         `json:"message_id,omitempty"`
+	ResponseNotice string         `json:"response_notice,omitempty"`
 }
 
 // MessageEvent is the inbound payload from evo-ai-crm AgentBotListener.
@@ -45,6 +47,7 @@ type MessageEvent struct {
 	ContactID      int64          `json:"contact_id"`
 	MessageID      string         `json:"message_id"`
 	MessageContent string         `json:"message_content"`
+	ResponseNotice string         `json:"response_notice,omitempty"`
 	Attachments    []Attachment   `json:"attachments,omitempty"` // EVO-2180: incoming media (image/audio/…)
 	ApiKey         string         `json:"api_key"`
 	OutgoingURL    string         `json:"outgoing_url"`
@@ -92,6 +95,12 @@ func (e *MessageEvent) Validate() error {
 	}
 	if e.BotConfig.DelayPerCharacter < 0 {
 		return errors.New("delay_per_character must be >= 0")
+	}
+	if e.MessageID == "" {
+		return errors.New("message_id is required for idempotent processing")
+	}
+	if len(e.ResponseNotice) > 512 {
+		return errors.New("response_notice must not exceed 512 bytes")
 	}
 	return nil
 }
