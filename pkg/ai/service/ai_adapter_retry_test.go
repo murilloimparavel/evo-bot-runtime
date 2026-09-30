@@ -36,6 +36,54 @@ func retryReq(url string) *aiModel.A2ARequest {
 		ContactID:      42,
 		ConversationID: 7,
 		ApiKey:         "k",
+		MessageID:      "crm-message-123",
+	}
+}
+
+func TestCall_RetriesOnlyActiveIdempotencyConflict(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request aiModel.JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if request.Params.Message.MessageID != "crm-message-123" {
+			t.Errorf("messageId = %q, want stable CRM message ID", request.Params.Message.MessageID)
+		}
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"message":"The same message is currently being processed","details":{"error":{"message":"Request already in progress"}}}}`))
+			return
+		}
+		writeOK(w)
+	}))
+	defer server.Close()
+
+	adapter := aiService.NewAIAdapter(30, 2, 1)
+	response, err := adapter.Call(context.Background(), retryReq(server.URL))
+	if err != nil {
+		t.Fatalf("expected success after active-claim retry, got %v", err)
+	}
+	if response.Content != "ok" || atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("response=%+v calls=%d, want ok and exactly two attempts", response, calls)
+	}
+}
+
+func TestCall_DoesNotRetryIdempotencyPayloadConflict(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"message":"Idempotency key payload mismatch"}}`))
+	}))
+	defer server.Close()
+
+	adapter := aiService.NewAIAdapter(30, 3, 1)
+	if _, err := adapter.Call(context.Background(), retryReq(server.URL)); err == nil {
+		t.Fatal("expected permanent idempotency payload conflict")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("calls = %d, want 1 for permanent conflict", got)
 	}
 }
 

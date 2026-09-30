@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -32,13 +34,42 @@ type PipelineService interface {
 }
 
 type pipelineEntry struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	cfg         model.BotConfig // carries BotConfig from MessageEvent to dispatch stage
-	postbackURL string          // carries PostbackURL from MessageEvent to dispatch stage
-	outgoingURL string          // carries OutgoingURL (full A2A endpoint) from MessageEvent to AI stage
-	apiKey      string          // carries ApiKey from MessageEvent to AI stage
-	metadata    map[string]any  // carries Metadata from MessageEvent to AI stage (for tools context)
+	ctx            context.Context
+	cancel         context.CancelFunc
+	cfg            model.BotConfig // carries BotConfig from MessageEvent to dispatch stage
+	postbackURL    string          // carries PostbackURL from MessageEvent to dispatch stage
+	outgoingURL    string          // carries OutgoingURL (full A2A endpoint) from MessageEvent to AI stage
+	apiKey         string          // carries ApiKey from MessageEvent to AI stage
+	metadata       map[string]any  // carries Metadata from MessageEvent to AI stage (for tools context)
+	responseNotice string          // deterministic CRM notice appended after the AI response
+}
+
+func appendResponseNotice(content, notice string) string {
+	notice = strings.TrimSpace(notice)
+	content = strings.TrimSpace(content)
+	if notice == "" || strings.Contains(content, notice) {
+		return content
+	}
+	if content == "" {
+		return notice
+	}
+	return content + "\n\n" + notice
+}
+
+func stableMessageID(messageIDs []string) string {
+	hash := sha256.New()
+	for _, id := range messageIDs {
+		if id == "" {
+			continue
+		}
+		_, _ = hash.Write([]byte(id))
+		_, _ = hash.Write([]byte{0})
+	}
+	return "debounce:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+func legacyDebounceMessageID(pair model.PairID, createdAt time.Time) string {
+	return stableMessageID([]string{fmt.Sprintf("legacy:%d:%d:%d", pair.ContactID, pair.ConversationID, createdAt.UnixNano())})
 }
 
 type pipelineService struct {
@@ -86,19 +117,31 @@ func (s *pipelineService) Start() error {
 		if err != nil || state == nil || state.Stage != model.StageDebounce {
 			continue
 		}
+		messageIDs, idsErr := s.repo.GetMessageIDs(ctx, pair.ContactID, pair.ConversationID)
+		if idsErr != nil {
+			return fmt.Errorf("pipeline.start.get_message_ids for pair %s: %w", pairKey(pair.ContactID, pair.ConversationID), idsErr)
+		}
+		if len(messageIDs) > 0 {
+			state.MessageID = stableMessageID(messageIDs)
+		} else if state.MessageID == "" {
+			// Backward compatibility for debounce state written before CRM message
+			// IDs were persisted by the runtime.
+			state.MessageID = legacyDebounceMessageID(pair, state.CreatedAt)
+		}
 		// Recreate entry only if not already in memory (avoids overwriting cancel funcs
 		// for pairs that received a Process call concurrently with Start recovery).
 		key := pairKey(pair.ContactID, pair.ConversationID)
 		if _, alreadyExists := s.entries.Load(key); !alreadyExists {
 			pipelineCtx, cancel := context.WithCancel(context.Background())
 			s.entries.Store(key, pipelineEntry{
-				ctx:         pipelineCtx,
-				cancel:      cancel,
-				cfg:         state.BotConfig,
-				postbackURL: state.PostbackURL,
-				outgoingURL: state.OutgoingURL,
-				apiKey:      state.ApiKey,
-				metadata:    state.Metadata,
+				ctx:            pipelineCtx,
+				cancel:         cancel,
+				cfg:            state.BotConfig,
+				postbackURL:    state.PostbackURL,
+				outgoingURL:    state.OutgoingURL,
+				apiKey:         state.ApiKey,
+				metadata:       state.Metadata,
+				responseNotice: state.ResponseNotice,
 			})
 		}
 
@@ -139,7 +182,7 @@ func (s *pipelineService) Process(ctx context.Context, event *model.MessageEvent
 		}
 		return s.startDebounce(ctx, event)
 	case state.Stage == model.StageDebounce:
-		return s.resetDebounce(ctx, event)
+		return s.resetDebounce(ctx, event, state)
 	case state.Stage == model.StageAI || state.Stage == model.StageDispatch:
 		s.cancelPair(event.ContactID, event.ConversationID)
 		if err := s.repo.ClearState(ctx, event.ContactID, event.ConversationID); err != nil {
@@ -161,16 +204,17 @@ func (s *pipelineService) startDebounce(ctx context.Context, event *model.Messag
 	pipelineCtx, cancel := context.WithCancel(context.Background())
 	key := pairKey(event.ContactID, event.ConversationID)
 	s.entries.Store(key, pipelineEntry{
-		ctx:         pipelineCtx,
-		cancel:      cancel,
-		cfg:         event.BotConfig,
-		postbackURL: event.PostbackURL,
-		outgoingURL: event.OutgoingURL,
-		apiKey:      event.ApiKey,
-		metadata:    event.Metadata,
+		ctx:            pipelineCtx,
+		cancel:         cancel,
+		cfg:            event.BotConfig,
+		postbackURL:    event.PostbackURL,
+		outgoingURL:    event.OutgoingURL,
+		apiKey:         event.ApiKey,
+		metadata:       event.Metadata,
+		responseNotice: strings.TrimSpace(event.ResponseNotice),
 	})
 
-	if err := s.debounce.Start(ctx, event.ContactID, event.ConversationID, event.MessageContent, event.Attachments, event.BotConfig); err != nil {
+	if err := s.debounce.Start(ctx, event.ContactID, event.ConversationID, event.MessageContent, event.MessageID, event.Attachments, event.BotConfig); err != nil {
 		cancel()
 		s.entries.Delete(key)
 		return fmt.Errorf("pipeline.debounce.start: %w", err)
@@ -179,13 +223,15 @@ func (s *pipelineService) startDebounce(ctx context.Context, event *model.Messag
 	// Persist BotConfig, PostbackURL, AgentBotID and ApiKey alongside the stage so that
 	// Start() recovery after a restart can reconstruct the pipelineEntry correctly (NFR-01).
 	newState := &model.PipelineState{
-		Stage:       model.StageDebounce,
-		CreatedAt:   time.Now(),
-		BotConfig:   event.BotConfig,
-		PostbackURL: event.PostbackURL,
-		OutgoingURL: event.OutgoingURL,
-		ApiKey:      event.ApiKey,
-		Metadata:    event.Metadata,
+		Stage:          model.StageDebounce,
+		CreatedAt:      time.Now(),
+		BotConfig:      event.BotConfig,
+		PostbackURL:    event.PostbackURL,
+		OutgoingURL:    event.OutgoingURL,
+		ApiKey:         event.ApiKey,
+		Metadata:       event.Metadata,
+		MessageID:      event.MessageID,
+		ResponseNotice: strings.TrimSpace(event.ResponseNotice),
 	}
 	if err := s.repo.SetState(ctx, event.ContactID, event.ConversationID, newState); err != nil {
 		cancel()
@@ -206,18 +252,19 @@ func (s *pipelineService) skipDebounce(ctx context.Context, event *model.Message
 	pipelineCtx, cancel := context.WithCancel(context.Background())
 	key := pairKey(event.ContactID, event.ConversationID)
 	s.entries.Store(key, pipelineEntry{
-		ctx:         pipelineCtx,
-		cancel:      cancel,
-		cfg:         event.BotConfig,
-		postbackURL: event.PostbackURL,
-		outgoingURL: event.OutgoingURL,
-		apiKey:      event.ApiKey,
-		metadata:    event.Metadata,
+		ctx:            pipelineCtx,
+		cancel:         cancel,
+		cfg:            event.BotConfig,
+		postbackURL:    event.PostbackURL,
+		outgoingURL:    event.OutgoingURL,
+		apiKey:         event.ApiKey,
+		metadata:       event.Metadata,
+		responseNotice: strings.TrimSpace(event.ResponseNotice),
 	})
 
 	// debounce.Start appends to buffer; DebounceTime=0 means no timer (Story 2.1).
 	if err := s.debounce.Start(ctx, event.ContactID, event.ConversationID,
-		event.MessageContent, event.Attachments, event.BotConfig); err != nil {
+		event.MessageContent, event.MessageID, event.Attachments, event.BotConfig); err != nil {
 		cancel()
 		s.entries.Delete(key)
 		return fmt.Errorf("pipeline.skip_debounce.start: %w", err)
@@ -242,7 +289,12 @@ func (s *pipelineService) skipDebounce(ctx context.Context, event *model.Message
 		atts = nil
 	}
 
-	newState := &model.PipelineState{Stage: model.StageAI, CreatedAt: time.Now()}
+	newState := &model.PipelineState{
+		Stage:          model.StageAI,
+		CreatedAt:      time.Now(),
+		MessageID:      event.MessageID,
+		ResponseNotice: strings.TrimSpace(event.ResponseNotice),
+	}
 	if err := s.repo.SetState(ctx, event.ContactID, event.ConversationID, newState); err != nil {
 		cancel()
 		s.entries.Delete(key)
@@ -253,13 +305,24 @@ func (s *pipelineService) skipDebounce(ctx context.Context, event *model.Message
 		"contact_id", event.ContactID,
 		"conversation_id", event.ConversationID,
 	)
-	s.launchAIStage(event.ContactID, event.ConversationID, buffer, atts)
+	s.launchAIStage(event.ContactID, event.ConversationID, buffer, atts, event.MessageID)
 	return nil
 }
 
-func (s *pipelineService) resetDebounce(ctx context.Context, event *model.MessageEvent) error {
-	if err := s.debounce.Reset(ctx, event.ContactID, event.ConversationID, event.MessageContent, event.Attachments, event.BotConfig); err != nil {
+func (s *pipelineService) resetDebounce(ctx context.Context, event *model.MessageEvent, state *model.PipelineState) error {
+	if err := s.debounce.Reset(ctx, event.ContactID, event.ConversationID, event.MessageContent, event.MessageID, event.Attachments, event.BotConfig); err != nil {
 		return fmt.Errorf("pipeline.debounce.reset: %w", err)
+	}
+	state.ResponseNotice = appendResponseNotice(state.ResponseNotice, event.ResponseNotice)
+	if err := s.repo.SetState(ctx, event.ContactID, event.ConversationID, state); err != nil {
+		return fmt.Errorf("pipeline.debounce.update_response_notice: %w", err)
+	}
+	key := pairKey(event.ContactID, event.ConversationID)
+	if value, ok := s.entries.Load(key); ok {
+		if entry, valid := value.(pipelineEntry); valid {
+			entry.responseNotice = state.ResponseNotice
+			s.entries.Store(key, entry)
+		}
 	}
 	slog.Info("pipeline.debounce.reset",
 		"contact_id", event.ContactID,
@@ -313,8 +376,23 @@ func (s *pipelineService) advanceToAI(contactID, conversationID int64) {
 		)
 		atts = nil
 	}
+	messageIDs, err := s.repo.GetMessageIDs(ctx, contactID, conversationID)
+	if err != nil {
+		slog.Error("pipeline.debounce.get_message_ids_failed", "contact_id", contactID, "conversation_id", conversationID, "error", err)
+		return
+	}
+	if len(messageIDs) > 0 {
+		state.MessageID = stableMessageID(messageIDs)
+	} else if state.MessageID == "" {
+		state.MessageID = legacyDebounceMessageID(model.PairID{ContactID: contactID, ConversationID: conversationID}, state.CreatedAt)
+	}
 
-	newState := &model.PipelineState{Stage: model.StageAI, CreatedAt: time.Now()}
+	newState := &model.PipelineState{
+		Stage:          model.StageAI,
+		CreatedAt:      time.Now(),
+		MessageID:      state.MessageID,
+		ResponseNotice: state.ResponseNotice,
+	}
 	if err := s.repo.SetState(ctx, contactID, conversationID, newState); err != nil {
 		slog.Error("pipeline.debounce.set_ai_state_failed",
 			"contact_id", contactID,
@@ -329,13 +407,13 @@ func (s *pipelineService) advanceToAI(contactID, conversationID int64) {
 		"conversation_id", conversationID,
 		"buffer_len", len(buffer),
 	)
-	s.launchAIStage(contactID, conversationID, buffer, atts)
+	s.launchAIStage(contactID, conversationID, buffer, atts, state.MessageID)
 }
 
 // launchAIStage launches the AI goroutine with the stored pipeline context.
 // Must be called only after pipelineEntry is stored in s.entries (guaranteed by
 // startDebounce/skipDebounce/advanceToAI).
-func (s *pipelineService) launchAIStage(contactID, conversationID int64, buffer string, atts []model.Attachment) {
+func (s *pipelineService) launchAIStage(contactID, conversationID int64, buffer string, atts []model.Attachment, messageID string) {
 	key := pairKey(contactID, conversationID)
 	v, ok := s.entries.Load(key)
 	if !ok {
@@ -354,12 +432,12 @@ func (s *pipelineService) launchAIStage(contactID, conversationID int64, buffer 
 		)
 		return
 	}
-	go s.runAIStage(entry.ctx, contactID, conversationID, buffer, atts, entry.cfg, entry.postbackURL)
+	go s.runAIStage(entry.ctx, contactID, conversationID, buffer, atts, entry.cfg, entry.postbackURL, messageID)
 }
 
 // runAIStage is the AI stage goroutine body. ctx is pipelineEntry.ctx — cancelled by
 // Process when a new message arrives for the same pair.
-func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversationID int64, buffer string, atts []model.Attachment, cfg model.BotConfig, postbackURL string) {
+func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversationID int64, buffer string, atts []model.Attachment, cfg model.BotConfig, postbackURL, messageID string) {
 	defer s.recoverPipeline(contactID, conversationID)
 
 	slog.Info("pipeline.ai.started",
@@ -372,14 +450,15 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 	key := pairKey(contactID, conversationID)
 	var outgoingURL, apiKey string
 	var metadata map[string]any
+	var responseNotice string
 	if v, ok := s.entries.Load(key); ok {
 		if entry, ok := v.(pipelineEntry); ok {
 			outgoingURL = entry.outgoingURL
 			apiKey = entry.apiKey
 			metadata = entry.metadata
+			responseNotice = entry.responseNotice
 		}
 	}
-
 	// EVO-2180: forward incoming media (aggregated over the debounce window) so the
 	// adapter can download + base64-encode it into A2A file parts.
 	aiAttachments := make([]aiModel.Attachment, 0, len(atts))
@@ -395,6 +474,7 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 		OutgoingURL:    outgoingURL,
 		ContactID:      contactID,
 		ConversationID: conversationID,
+		MessageID:      messageID,
 		ApiKey:         apiKey,
 		Message:        buffer,
 		Metadata:       metadata,
@@ -431,6 +511,15 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 		}
 		return
 	}
+	if resp == nil {
+		slog.Error("pipeline.ai.empty_response",
+			"contact_id", contactID,
+			"conversation_id", conversationID,
+		)
+		s.clearStateWithLog(contactID, conversationID)
+		return
+	}
+	resp.Content = appendResponseNotice(resp.Content, responseNotice)
 
 	// Success path — use cleanupCtx() for Redis calls: pipeline ctx may be cancelled.
 	dur := time.Since(start)

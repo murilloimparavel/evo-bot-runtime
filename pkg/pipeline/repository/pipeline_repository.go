@@ -21,6 +21,8 @@ type PipelineRepository interface {
 
 	AppendToBuffer(ctx context.Context, contactID, conversationID int64, content string) error
 	GetBuffer(ctx context.Context, contactID, conversationID int64) ([]string, error)
+	AppendMessageID(ctx context.Context, contactID, conversationID int64, messageID string) error
+	GetMessageIDs(ctx context.Context, contactID, conversationID int64) ([]string, error)
 
 	// EVO-2180: incoming media buffer, aggregated across the debounce window exactly
 	// like the text buffer. Cleared together with the text buffer in ClearState.

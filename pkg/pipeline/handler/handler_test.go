@@ -39,6 +39,10 @@ func (m *mockRepo) AppendToBuffer(_ context.Context, _, _ int64, _ string) error
 func (m *mockRepo) GetBuffer(_ context.Context, _, _ int64) ([]string, error) {
 	return nil, nil
 }
+func (m *mockRepo) AppendMessageID(_ context.Context, _, _ int64, _ string) error { return nil }
+func (m *mockRepo) GetMessageIDs(_ context.Context, _, _ int64) ([]string, error) {
+	return nil, nil
+}
 func (m *mockRepo) AppendAttachments(_ context.Context, _, _ int64, _ []model.Attachment) error {
 	return nil
 }
@@ -144,6 +148,26 @@ func TestHandleEvent_500_OnSetStateError(t *testing.T) {
 	}
 	if body["code"] != "ERR_INTERNAL" {
 		t.Errorf("body.code: got %q, want %q", body["code"], "ERR_INTERNAL")
+	}
+}
+
+func TestHandleEvent_400_WhenMessageIDMissing(t *testing.T) {
+	payload := validPayload()
+	var event map[string]any
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatal(err)
+	}
+	delete(event, "message_id")
+	payload, _ = json.Marshal(event)
+	r := setupRouter(&mockRepo{}, &mockSvc{})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Bot-Runtime-Secret", testSecret)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
 

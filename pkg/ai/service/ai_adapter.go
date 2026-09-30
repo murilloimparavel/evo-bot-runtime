@@ -134,8 +134,9 @@ func (a *aiAdapter) Call(ctx context.Context, req *model.A2ARequest) (*model.Nor
 			ContextID: contextID,
 			UserID:    userID,
 			Message: model.JSONRPCMessage{
-				Role:  "user",
-				Parts: parts,
+				Role:      "user",
+				Parts:     parts,
+				MessageID: req.MessageID,
 			},
 			Metadata: nonNilMetadata(req.Metadata),
 		},
@@ -243,9 +244,12 @@ func (a *aiAdapter) doOnce(
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		retryable := isRetryableStatus(resp.StatusCode)
-		// Drain a bounded amount so the connection can be reused.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		// A duplicate message may meet another still-running processor request.
+		// Retry only that explicit 409; payload conflicts and expired claims remain
+		// permanent so the runtime cannot accidentally repeat side effects.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		retryable := isRetryableStatus(resp.StatusCode) ||
+			(resp.StatusCode == http.StatusConflict && bytes.Contains(body, []byte("Request already in progress")))
 		return nil, retryable, fmt.Errorf("pipeline.ai.status: unexpected %d from AI Processor", resp.StatusCode)
 	}
 

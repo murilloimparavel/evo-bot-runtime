@@ -67,6 +67,9 @@ func TestCall_Success(t *testing.T) {
 		if req.Params.UserID != "contact-uuid-xyz" {
 			t.Errorf("req.Params.UserID = %q, want %q", req.Params.UserID, "contact-uuid-xyz")
 		}
+		if req.Params.Message.MessageID != "crm-message-123" {
+			t.Errorf("req.Params.Message.MessageID = %q, want %q", req.Params.Message.MessageID, "crm-message-123")
+		}
 		if len(req.Params.Message.Parts) != 1 || req.Params.Message.Parts[0].Text != "hello world" {
 			t.Errorf("message parts = %+v, want single part with text 'hello world'", req.Params.Message.Parts)
 		}
@@ -92,6 +95,7 @@ func TestCall_Success(t *testing.T) {
 		ContactID:      42,
 		ConversationID: 7,
 		ApiKey:         "test-key",
+		MessageID:      "crm-message-123",
 		Metadata:       crmMetadata("conv-uuid-abc", "contact-uuid-xyz"),
 	})
 	if err != nil {
