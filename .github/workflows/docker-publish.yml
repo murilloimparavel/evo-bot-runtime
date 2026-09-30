@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  IMAGE_NAME: evoapicloud/evo-bot-runtime
+  IMAGE_NAME: ghcr.io/murilloimparavel/evo-bot-runtime
 
 jobs:
   build-pr:
@@ -45,6 +45,9 @@ jobs:
     if: github.event_name != 'pull_request'
     name: Build ${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -58,10 +61,12 @@ jobs:
 
       - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
-      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push by digest
         id: build
@@ -94,6 +99,9 @@ jobs:
     name: Merge Manifests & Tag
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -103,10 +111,12 @@ jobs:
 
       - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
-      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Resolve tags
         id: tags
@@ -121,11 +131,11 @@ jobs:
 
           if [[ "${GH_REF}" == refs/tags/v* ]]; then
             VERSION="${GH_REF_NAME#v}"
-            TAGS="${IMAGE}:${VERSION},${IMAGE}:latest"
+            TAGS="${IMAGE}:${VERSION},${IMAGE}:latest,${IMAGE}:sha-${GH_SHA}"
           elif [[ "${GH_REF}" == refs/heads/main ]]; then
-            TAGS="${IMAGE}:latest,${IMAGE}:main-${SHA_SHORT}"
+            TAGS="${IMAGE}:latest,${IMAGE}:sha-${GH_SHA},${IMAGE}:main-${SHA_SHORT}"
           elif [[ "${GH_REF}" == refs/heads/develop ]]; then
-            TAGS="${IMAGE}:develop,${IMAGE}:develop-${SHA_SHORT}"
+            TAGS="${IMAGE}:develop,${IMAGE}:sha-${GH_SHA},${IMAGE}:develop-${SHA_SHORT}"
           fi
 
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
