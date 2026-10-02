@@ -21,6 +21,7 @@ type postbackBody struct {
 	Content     string `json:"content"`
 	MessageType string `json:"message_type"`
 	ContentType string `json:"content_type"`
+	Force       bool   `json:"force"`
 }
 
 func collectParts(t *testing.T) (*httptest.Server, *[]string, *sync.Mutex) {
@@ -52,7 +53,7 @@ func TestDispatch_MultiPart_SignatureOnFirstOnly(t *testing.T) {
 	}
 
 	// "hello world this is test" → segments of ≤15 chars
-	if err := eng.Dispatch(context.Background(), 1, 1, "hello world this is test", cfg, server.URL); err != nil {
+	if err := eng.Dispatch(context.Background(), 1, 1, "hello world this is test", cfg, false, server.URL); err != nil {
 		t.Fatalf("Dispatch returned unexpected error: %v", err)
 	}
 
@@ -86,7 +87,7 @@ func TestDispatch_NoSegmentation_SinglePart(t *testing.T) {
 		DelayPerCharacter:       0,
 	}
 
-	if err := eng.Dispatch(context.Background(), 2, 2, "full response here", cfg, server.URL); err != nil {
+	if err := eng.Dispatch(context.Background(), 2, 2, "full response here", cfg, false, server.URL); err != nil {
 		t.Fatalf("Dispatch returned unexpected error: %v", err)
 	}
 
@@ -101,6 +102,50 @@ func TestDispatch_NoSegmentation_SinglePart(t *testing.T) {
 	want := "—signature full response here"
 	if parts[0] != want {
 		t.Errorf("parts[0] = %q, want %q", parts[0], want)
+	}
+}
+
+func TestDispatch_TerminalHandoffUsesSingleForcedPostback(t *testing.T) {
+	var bodies []postbackBody
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body postbackBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode postback: %v", err)
+		}
+		bodies = append(bodies, body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := model.BotConfig{TextSegmentationEnabled: true, TextSegmentationLimit: 8, MessageSignature: "*Sofia* "}
+	eng := service.NewDispatchEngine("")
+	if err := eng.Dispatch(context.Background(), 1, 1, "Transferindo você para o suporte agora.", cfg, true, server.URL); err != nil {
+		t.Fatalf("Dispatch returned unexpected error: %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("got %d postbacks, want exactly one terminal postback", len(bodies))
+	}
+	if !bodies[0].Force {
+		t.Fatal("terminal handoff postback must carry force=true")
+	}
+}
+
+func TestDispatch_OrdinaryReplyDoesNotForcePostback(t *testing.T) {
+	var force bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body postbackBody
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		force = body.Force
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	eng := service.NewDispatchEngine("")
+	if err := eng.Dispatch(context.Background(), 1, 1, "Resposta comum.", model.BotConfig{}, false, server.URL); err != nil {
+		t.Fatalf("Dispatch returned unexpected error: %v", err)
+	}
+	if force {
+		t.Fatal("ordinary response must not carry force=true")
 	}
 }
 
@@ -130,7 +175,7 @@ func TestDispatch_Cancellation_ReturnsInterrupted(t *testing.T) {
 		cancel()
 	}()
 
-	err := eng.Dispatch(ctx, 3, 3, "alpha beta gamma delta epsilon", cfg, server.URL)
+	err := eng.Dispatch(ctx, 3, 3, "alpha beta gamma delta epsilon", cfg, false, server.URL)
 	if !errors.Is(err, brtErrors.ErrDispatchInterrupted) {
 		t.Errorf("expected ErrDispatchInterrupted, got %v", err)
 	}
@@ -155,7 +200,7 @@ func TestDispatch_EmptySignature_NoSuffix(t *testing.T) {
 		MessageSignature:        "", // empty — no suffix
 	}
 
-	if err := eng.Dispatch(context.Background(), 4, 4, "no signature here", cfg, server.URL); err != nil {
+	if err := eng.Dispatch(context.Background(), 4, 4, "no signature here", cfg, false, server.URL); err != nil {
 		t.Fatalf("Dispatch returned unexpected error: %v", err)
 	}
 
@@ -181,7 +226,7 @@ func TestDispatch_NonOKResponse_ReturnsError(t *testing.T) {
 	eng := service.NewDispatchEngine("")
 	cfg := model.BotConfig{TextSegmentationEnabled: false}
 
-	err := eng.Dispatch(context.Background(), 8, 8, "some content", cfg, server.URL)
+	err := eng.Dispatch(context.Background(), 8, 8, "some content", cfg, false, server.URL)
 	if err == nil {
 		t.Fatal("expected error for non-2xx response, got nil")
 	}
@@ -200,7 +245,7 @@ func TestSegmentContent_MergeDoesNotExceedLimit(t *testing.T) {
 		DelayPerCharacter:       0,
 	}
 
-	if err := eng.Dispatch(context.Background(), 6, 6, "hello world test", cfg, server.URL); err != nil {
+	if err := eng.Dispatch(context.Background(), 6, 6, "hello world test", cfg, false, server.URL); err != nil {
 		t.Fatalf("Dispatch returned unexpected error: %v", err)
 	}
 
@@ -234,7 +279,7 @@ func TestSegmentContent_RuneAwareLimits(t *testing.T) {
 		DelayPerCharacter:       0,
 	}
 
-	if err := eng.Dispatch(context.Background(), 7, 7, "olá mundo", cfg, server.URL); err != nil {
+	if err := eng.Dispatch(context.Background(), 7, 7, "olá mundo", cfg, false, server.URL); err != nil {
 		t.Fatalf("Dispatch returned unexpected error: %v", err)
 	}
 
@@ -265,7 +310,7 @@ func TestDispatch_ValidatesPostBody(t *testing.T) {
 	eng := service.NewDispatchEngine("")
 	cfg := model.BotConfig{TextSegmentationEnabled: false}
 
-	if err := eng.Dispatch(context.Background(), 5, 5, "test content", cfg, server.URL); err != nil {
+	if err := eng.Dispatch(context.Background(), 5, 5, "test content", cfg, false, server.URL); err != nil {
 		t.Fatalf("Dispatch returned unexpected error: %v", err)
 	}
 

@@ -555,7 +555,7 @@ func (s *pipelineService) launchDispatchStage(
 	cfg model.BotConfig,
 	postbackURL string,
 ) {
-	go s.runDispatchStage(ctx, contactID, conversationID, resp.Content, cfg, postbackURL)
+	go s.runDispatchStage(ctx, contactID, conversationID, resp.Content, cfg, postbackURL, resp.TerminalHandoff)
 }
 
 // runDispatchStage is the dispatch stage goroutine body. ctx is pipelineEntry.ctx — cancelled by
@@ -567,6 +567,7 @@ func (s *pipelineService) runDispatchStage(
 	content string,
 	cfg model.BotConfig,
 	postbackURL string,
+	terminalHandoff bool,
 ) {
 	defer s.recoverPipeline(contactID, conversationID)
 
@@ -576,7 +577,7 @@ func (s *pipelineService) runDispatchStage(
 	)
 	start := time.Now()
 
-	err := s.dispatchEng.Dispatch(ctx, contactID, conversationID, content, cfg, postbackURL)
+	err := s.dispatchEng.Dispatch(ctx, contactID, conversationID, content, cfg, terminalHandoff, postbackURL)
 	if err != nil {
 		switch {
 		case errors.Is(err, brtErrors.ErrDispatchInterrupted):
@@ -787,7 +788,7 @@ func (s *pipelineService) sendAIFailureNotice(
 	defer cancel()
 	defer s.recoverPipeline(contactID, conversationID)
 
-	if err := s.dispatchEng.Dispatch(ctx, contactID, conversationID, notice, cfg, postbackURL); err != nil {
+	if err := s.dispatchEng.Dispatch(ctx, contactID, conversationID, notice, cfg, false, postbackURL); err != nil {
 		slog.Warn("pipeline.ai.failure_notice.failed",
 			"contact_id", contactID,
 			"conversation_id", conversationID,

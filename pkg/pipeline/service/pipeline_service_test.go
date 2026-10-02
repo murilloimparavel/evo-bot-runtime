@@ -43,11 +43,11 @@ var _ aiIface.AIAdapter = (*mockAIAdapter)(nil)
 
 // mockDispatchEngine implements dispatchIface.DispatchEngine for testing.
 type mockDispatchEngine struct {
-	dispatchFn func(ctx context.Context, contactID, conversationID int64, content string, cfg model.BotConfig, postbackURL string) error
+	dispatchFn func(ctx context.Context, contactID, conversationID int64, content string, cfg model.BotConfig, terminalHandoff bool, postbackURL string) error
 }
 
-func (m *mockDispatchEngine) Dispatch(ctx context.Context, contactID, conversationID int64, content string, cfg model.BotConfig, postbackURL string) error {
-	return m.dispatchFn(ctx, contactID, conversationID, content, cfg, postbackURL)
+func (m *mockDispatchEngine) Dispatch(ctx context.Context, contactID, conversationID int64, content string, cfg model.BotConfig, terminalHandoff bool, postbackURL string) error {
+	return m.dispatchFn(ctx, contactID, conversationID, content, cfg, terminalHandoff, postbackURL)
 }
 
 var _ dispatchIface.DispatchEngine = (*mockDispatchEngine)(nil) // compile-time check
@@ -136,7 +136,7 @@ func setupSvcWithAIAndDispatch(t *testing.T, ai aiIface.AIAdapter, dispatch disp
 // that existing tests checking for StageDispatch see it before dispatch completes.
 func setupSvcWithAI(t *testing.T, ai aiIface.AIAdapter) (*pipelineService, *redis.Client) {
 	blockingDispatch := &mockDispatchEngine{
-		dispatchFn: func(ctx context.Context, _, _ int64, _ string, _ model.BotConfig, _ string) error {
+		dispatchFn: func(ctx context.Context, _, _ int64, _ string, _ model.BotConfig, _ bool, _ string) error {
 			<-ctx.Done()
 			return brtErrors.ErrDispatchInterrupted
 		},
@@ -527,7 +527,7 @@ func TestAIStage_AppendsResponseNoticeToSingleAgentDispatch(t *testing.T) {
 		},
 	}
 	dispatch := &mockDispatchEngine{
-		dispatchFn: func(_ context.Context, _, _ int64, content string, _ model.BotConfig, _ string) error {
+		dispatchFn: func(_ context.Context, _, _ int64, content string, _ model.BotConfig, _ bool, _ string) error {
 			dispatched <- content
 			return nil
 		},
@@ -555,6 +555,40 @@ func TestAIStage_AppendsResponseNoticeToSingleAgentDispatch(t *testing.T) {
 	}
 	if aiMessage != "Quero reservar" {
 		t.Errorf("AI received %q; response notice must stay out of user input", aiMessage)
+	}
+}
+
+func TestAIStage_ForwardsTerminalHandoffToDispatch(t *testing.T) {
+	dispatched := make(chan bool, 1)
+	mock := &mockAIAdapter{
+		callFn: func(_ context.Context, _ *aiModel.A2ARequest) (*aiModel.NormalizedResponse, error) {
+			return &aiModel.NormalizedResponse{Content: "Vou encaminhar você para a equipe.", TerminalHandoff: true}, nil
+		},
+	}
+	dispatch := &mockDispatchEngine{
+		dispatchFn: func(_ context.Context, _, _ int64, _ string, _ model.BotConfig, terminalHandoff bool, _ string) error {
+			dispatched <- terminalHandoff
+			return nil
+		},
+	}
+	svc, _ := setupSvcWithAIAndDispatch(t, mock, dispatch)
+	event := &model.MessageEvent{
+		ContactID: 99093, ConversationID: 99093, MessageID: "crm-message-99093",
+		MessageContent: "Quero falar com uma pessoa",
+		BotConfig:      model.BotConfig{DebounceTime: 0},
+	}
+
+	if err := svc.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process returned error: %v", err)
+	}
+
+	select {
+	case got := <-dispatched:
+		if !got {
+			t.Error("dispatch must receive terminalHandoff=true for a successful handoff")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AI handoff response was not dispatched")
 	}
 }
 
@@ -689,7 +723,7 @@ func TestPipeline_FullFlow_DispatchCompletes(t *testing.T) {
 		},
 	}
 	mockDispatch := &mockDispatchEngine{
-		dispatchFn: func(_ context.Context, _, _ int64, _ string, _ model.BotConfig, _ string) error {
+		dispatchFn: func(_ context.Context, _, _ int64, _ string, _ model.BotConfig, _ bool, _ string) error {
 			return nil
 		},
 	}
@@ -722,7 +756,7 @@ func TestPipeline_DispatchInterrupted_KeepsNewDebounce(t *testing.T) {
 	}
 	dispatchDone := make(chan struct{})
 	mockDispatch := &mockDispatchEngine{
-		dispatchFn: func(ctx context.Context, _, _ int64, _ string, _ model.BotConfig, _ string) error {
+		dispatchFn: func(ctx context.Context, _, _ int64, _ string, _ model.BotConfig, _ bool, _ string) error {
 			defer close(dispatchDone)
 			<-ctx.Done() // block until pipeline context is cancelled
 			return brtErrors.ErrDispatchInterrupted
@@ -775,7 +809,7 @@ func TestPipeline_DispatchError_ClearsState(t *testing.T) {
 	}
 	dispatchDone := make(chan struct{})
 	mockDispatch := &mockDispatchEngine{
-		dispatchFn: func(_ context.Context, _, _ int64, _ string, _ model.BotConfig, _ string) error {
+		dispatchFn: func(_ context.Context, _, _ int64, _ string, _ model.BotConfig, _ bool, _ string) error {
 			defer close(dispatchDone)
 			return fmt.Errorf("postback server unavailable")
 		},

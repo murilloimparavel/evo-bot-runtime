@@ -259,6 +259,7 @@ func (a *aiAdapter) doOnce(
 	}
 
 	content := extractResponseText(&a2aResp)
+	terminalHandoff := hasTerminalHandoff(&a2aResp)
 
 	slog.Info("pipeline.ai.http.completed",
 		"contact_id", req.ContactID,
@@ -266,7 +267,7 @@ func (a *aiAdapter) doOnce(
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 
-	return &model.NormalizedResponse{Content: content}, false, nil
+	return &model.NormalizedResponse{Content: content, TerminalHandoff: terminalHandoff}, false, nil
 }
 
 // isRetryableStatus reports whether an HTTP status from the AI Processor is a
@@ -322,6 +323,22 @@ func extractResponseText(resp *model.A2AResponse) string {
 		}
 	}
 	return ""
+}
+
+// hasTerminalHandoff recognizes only the processor's explicit data artifact.
+// Ordinary response text or user-controlled metadata cannot activate CRM force.
+func hasTerminalHandoff(resp *model.A2AResponse) bool {
+	if resp == nil || resp.Result == nil {
+		return false
+	}
+	for _, artifact := range resp.Result.Artifacts {
+		for _, part := range artifact.Parts {
+			if part.Type == "data" && part.Data["terminal_handoff"] == true {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // nonNilMetadata ensures metadata is never nil (avoids "null" in JSON).

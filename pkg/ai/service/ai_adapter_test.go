@@ -106,6 +106,45 @@ func TestCall_Success(t *testing.T) {
 	}
 }
 
+func TestCall_RecognizesTerminalHandoffDataArtifact(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(aiModel.A2AResponse{Result: &aiModel.A2AResult{
+			Artifacts: []aiModel.A2AArtifact{
+				{Parts: []aiModel.A2APart{{Type: "text", Text: "Vou encaminhar para o suporte."}}},
+				{Parts: []aiModel.A2APart{{Type: "data", Data: map[string]any{"terminal_handoff": true}}}},
+			},
+		}})
+	}))
+	defer server.Close()
+
+	adapter := aiService.NewAIAdapter(30, 0, 0)
+	resp, err := adapter.Call(context.Background(), &aiModel.A2ARequest{OutgoingURL: server.URL, Message: "preciso de uma pessoa"})
+	if err != nil {
+		t.Fatalf("Call returned unexpected error: %v", err)
+	}
+	if resp.Content != "Vou encaminhar para o suporte." || !resp.TerminalHandoff {
+		t.Fatalf("response = %+v, want text and terminal handoff marker", resp)
+	}
+}
+
+func TestCall_DoesNotInferHandoffFromResponseText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(aiModel.A2AResponse{Result: &aiModel.A2AResult{
+			Artifacts: []aiModel.A2AArtifact{{Parts: []aiModel.A2APart{{Type: "text", Text: "Transferindo ao suporte."}}}},
+		}})
+	}))
+	defer server.Close()
+
+	adapter := aiService.NewAIAdapter(30, 0, 0)
+	resp, err := adapter.Call(context.Background(), &aiModel.A2ARequest{OutgoingURL: server.URL, Message: "oi"})
+	if err != nil {
+		t.Fatalf("Call returned unexpected error: %v", err)
+	}
+	if resp.TerminalHandoff {
+		t.Fatal("plain response text must not activate terminal handoff")
+	}
+}
+
 // TestCall_ContextID_FallsBackToNumericID asserts that when the CRM metadata is
 // absent the adapter falls back to the numeric conversation ID (legacy behaviour),
 // so callers that do not send metadata keep working.
