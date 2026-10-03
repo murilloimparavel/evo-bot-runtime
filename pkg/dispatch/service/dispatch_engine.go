@@ -22,12 +22,13 @@ import (
 // Swap the dispatch backend by providing a different implementation at main.go wiring.
 type DispatchEngine interface {
 	Dispatch(
-		ctx            context.Context,
-		contactID      int64,
+		ctx context.Context,
+		contactID int64,
 		conversationID int64,
-		content        string,
-		cfg            model.BotConfig,
-		postbackURL    string,
+		content string,
+		cfg model.BotConfig,
+		terminalHandoff bool,
+		postbackURL string,
 	) error
 }
 
@@ -37,6 +38,7 @@ type postbackRequest struct {
 	MessageType string               `json:"message_type"`
 	ContentType string               `json:"content_type"`
 	Attachments []postbackAttachment `json:"attachments,omitempty"`
+	Force       bool                 `json:"force,omitempty"`
 }
 
 // postbackAttachment is a media URL detected in the AI response, sent to the CRM
@@ -66,12 +68,13 @@ func NewDispatchEngine(secret string) DispatchEngine {
 }
 
 func (d *dispatchEngineImpl) Dispatch(
-	ctx            context.Context,
-	contactID      int64,
+	ctx context.Context,
+	contactID int64,
 	conversationID int64,
-	content        string,
-	cfg            model.BotConfig,
-	postbackURL    string,
+	content string,
+	cfg model.BotConfig,
+	terminalHandoff bool,
+	postbackURL string,
 ) error {
 	// Pull media URLs out of the full response BEFORE segmenting, so media is
 	// not split across text parts. Media is delivered in a single dedicated
@@ -79,6 +82,11 @@ func (d *dispatchEngineImpl) Dispatch(
 	// from the text as a fallback, so this is an optimization, not the only path.
 	residual, atts := extractMediaURLs(content)
 
+	// A terminal handoff should be one CRM message: its trusted force marker
+	// must not be repeated across independently dispatched segments.
+	if terminalHandoff {
+		cfg.TextSegmentationEnabled = false
+	}
 	parts := segmentContent(residual, cfg)
 
 	// Prepend signature to the first part (FR-21)
@@ -99,15 +107,15 @@ func (d *dispatchEngineImpl) Dispatch(
 		select {
 		case <-ctx.Done():
 			slog.Info("pipeline.dispatch.interrupted",
-				"contact_id",      contactID,
+				"contact_id", contactID,
 				"conversation_id", conversationID,
-				"parts_sent",      i,
+				"parts_sent", i,
 			)
 			return brtErrors.ErrDispatchInterrupted
 		default:
 		}
 
-		if err := d.sendPart(ctx, postbackURL, part, nil); err != nil {
+		if err := d.sendPart(ctx, postbackURL, part, nil, terminalHandoff); err != nil {
 			return fmt.Errorf("pipeline.dispatch.send[%d]: %w", i, err)
 		}
 
@@ -117,9 +125,9 @@ func (d *dispatchEngineImpl) Dispatch(
 			select {
 			case <-ctx.Done():
 				slog.Info("pipeline.dispatch.interrupted",
-					"contact_id",      contactID,
+					"contact_id", contactID,
 					"conversation_id", conversationID,
-					"parts_sent",      i+1,
+					"parts_sent", i+1,
 				)
 				return brtErrors.ErrDispatchInterrupted
 			case <-time.After(delayMs):
@@ -134,29 +142,30 @@ func (d *dispatchEngineImpl) Dispatch(
 			return brtErrors.ErrDispatchInterrupted
 		default:
 		}
-		if err := d.sendPart(ctx, postbackURL, "", atts); err != nil {
+		if err := d.sendPart(ctx, postbackURL, "", atts, terminalHandoff); err != nil {
 			return fmt.Errorf("pipeline.dispatch.send[media]: %w", err)
 		}
 	}
 
 	slog.Info("pipeline.dispatch.completed",
-		"contact_id",      contactID,
+		"contact_id", contactID,
 		"conversation_id", conversationID,
-		"duration_ms",     time.Since(start).Milliseconds(),
-		"parts_total",     len(parts),
-		"attachments",     len(atts),
+		"duration_ms", time.Since(start).Milliseconds(),
+		"parts_total", len(parts),
+		"attachments", len(atts),
 	)
 	return nil
 }
 
 // sendPart sends a single content part (and optional media attachments) to the
 // postback URL.
-func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content string, atts []postbackAttachment) error {
+func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content string, atts []postbackAttachment, force bool) error {
 	body, err := json.Marshal(postbackRequest{
 		Content:     content,
 		MessageType: "outgoing",
 		ContentType: "text",
 		Attachments: atts,
+		Force:       force,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)

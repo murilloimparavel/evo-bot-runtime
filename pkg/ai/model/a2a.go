@@ -75,12 +75,14 @@ type A2AMessage struct {
 }
 
 type A2APart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type string         `json:"type"`
+	Text string         `json:"text"`
+	Data map[string]any `json:"data"`
 }
 
 // NormalizedResponse is the internal format after parsing A2AResponse.
 // No JSON tags — this type never crosses a service boundary.
 type NormalizedResponse struct {
-	Content string
+	Content         string
+	TerminalHandoff bool
 }
