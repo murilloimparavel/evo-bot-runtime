@@ -592,6 +592,58 @@ func TestAIStage_ForwardsTerminalHandoffToDispatch(t *testing.T) {
 	}
 }
 
+func TestAIStage_InvalidResponseSendsNoticeWithoutRetry(t *testing.T) {
+	t.Setenv("AI_FAILURE_NOTICE", "Desculpe, tivemos uma falha. Nossa equipe dará continuidade ao atendimento.")
+	for _, tc := range []struct {
+		name, content string
+		handoff       bool
+	}{
+		{"empty", "  ", false},
+		{"sentinel", " No response captured. ", false},
+		{"no-response", "No response", false},
+		{"no-content", "No content to process", false},
+		{"escalation", "Agent escalated: internal error", false},
+		{"handoff", "No response captured.", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			dispatched := make(chan struct {
+				content string
+				handoff bool
+			}, 1)
+			mock := &mockAIAdapter{callFn: func(_ context.Context, _ *aiModel.A2ARequest) (*aiModel.NormalizedResponse, error) {
+				calls++
+				return &aiModel.NormalizedResponse{Content: tc.content, TerminalHandoff: tc.handoff}, nil
+			}}
+			dispatch := &mockDispatchEngine{dispatchFn: func(_ context.Context, _, _ int64, content string, _ model.BotConfig, handoff bool, _ string) error {
+				dispatched <- struct {
+					content string
+					handoff bool
+				}{content, handoff}
+				return nil
+			}}
+			svc, _ := setupSvcWithAIAndDispatch(t, mock, dispatch)
+			event := &model.MessageEvent{ContactID: 99100, ConversationID: 99100, MessageID: "invalid-" + tc.name,
+				MessageContent: "Olá", ResponseNotice: "Aviso complementar", PostbackURL: "https://crm.example.test/postback",
+				BotConfig: model.BotConfig{DebounceTime: 0}}
+			if err := svc.Process(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case got := <-dispatched:
+				if got.content != "Desculpe, tivemos uma falha. Nossa equipe dará continuidade ao atendimento." || got.handoff != tc.handoff {
+					t.Fatalf("dispatch = %+v", got)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("failure notice not dispatched")
+			}
+			if calls != 1 {
+				t.Fatalf("AI calls = %d, want 1", calls)
+			}
+		})
+	}
+}
+
 func TestResetDebouncePersistsAndDeduplicatesResponseNotice(t *testing.T) {
 	svc, _ := setupSvcFull(t)
 	ctx := context.Background()
