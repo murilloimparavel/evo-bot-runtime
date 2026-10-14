@@ -56,6 +56,19 @@ func appendResponseNotice(content, notice string) string {
 	return content + "\n\n" + notice
 }
 
+// validAIResponse prevents internal processor sentinels from becoming customer
+// messages. Check before appending a deterministic notice: a notice alone does
+// not make an empty agent response successful.
+func validAIResponse(content string) bool {
+	content = strings.ToLower(strings.TrimSpace(content))
+	content = strings.TrimSuffix(content, ".")
+	switch content {
+	case "", "no response captured", "no response", "no content to process":
+		return false
+	}
+	return !strings.HasPrefix(content, "agent escalated:")
+}
+
 func stableMessageID(messageIDs []string) string {
 	hash := sha256.New()
 	for _, id := range messageIDs {
@@ -499,7 +512,7 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 			// CRM-236: silence is indistinguishable from "the bot is ignoring you",
 			// and the tool's side effect may already be applied (the card moved at
 			// ~20s, the timeout fired at 30s). Tell the customer something.
-			s.sendAIFailureNotice(contactID, conversationID, cfg, postbackURL, err)
+			s.sendAIFailureNotice(contactID, conversationID, cfg, postbackURL, err, false)
 		default:
 			slog.Error("pipeline.ai.error",
 				"contact_id", contactID,
@@ -507,7 +520,7 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 				"error", fmt.Errorf("pipeline.ai: %w", err),
 			)
 			s.clearStateWithLog(contactID, conversationID)
-			s.sendAIFailureNotice(contactID, conversationID, cfg, postbackURL, err)
+			s.sendAIFailureNotice(contactID, conversationID, cfg, postbackURL, err, false)
 		}
 		return
 	}
@@ -517,6 +530,16 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 			"conversation_id", conversationID,
 		)
 		s.clearStateWithLog(contactID, conversationID)
+		s.sendAIFailureNotice(contactID, conversationID, cfg, postbackURL, errors.New("empty AI response"), false)
+		return
+	}
+	if !validAIResponse(resp.Content) {
+		slog.Error("pipeline.ai.invalid_response",
+			"contact_id", contactID,
+			"conversation_id", conversationID,
+		)
+		s.clearStateWithLog(contactID, conversationID)
+		s.sendAIFailureNotice(contactID, conversationID, cfg, postbackURL, errors.New("invalid AI response"), resp.TerminalHandoff)
 		return
 	}
 	resp.Content = appendResponseNotice(resp.Content, responseNotice)
@@ -755,6 +778,7 @@ func (s *pipelineService) sendAIFailureNotice(
 	cfg model.BotConfig,
 	postbackURL string,
 	cause error,
+	terminalHandoff ...bool,
 ) {
 	notice := defaultAIFailureNotice
 	if v, ok := os.LookupEnv(aiFailureNoticeEnv); ok {
@@ -788,7 +812,8 @@ func (s *pipelineService) sendAIFailureNotice(
 	defer cancel()
 	defer s.recoverPipeline(contactID, conversationID)
 
-	if err := s.dispatchEng.Dispatch(ctx, contactID, conversationID, notice, cfg, false, postbackURL); err != nil {
+	forceHandoff := len(terminalHandoff) > 0 && terminalHandoff[0]
+	if err := s.dispatchEng.Dispatch(ctx, contactID, conversationID, notice, cfg, forceHandoff, postbackURL); err != nil {
 		slog.Warn("pipeline.ai.failure_notice.failed",
 			"contact_id", contactID,
 			"conversation_id", conversationID,
