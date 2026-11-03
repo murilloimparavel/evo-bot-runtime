@@ -41,6 +41,7 @@ type pipelineEntry struct {
 	outgoingURL    string          // carries OutgoingURL (full A2A endpoint) from MessageEvent to AI stage
 	apiKey         string          // carries ApiKey from MessageEvent to AI stage
 	metadata       map[string]any  // carries Metadata from MessageEvent to AI stage (for tools context)
+	agentBotID     string          // preserves trusted CRM event bot ID for grant issuance
 	responseNotice string          // deterministic CRM notice appended after the AI response
 }
 
@@ -154,6 +155,7 @@ func (s *pipelineService) Start() error {
 				outgoingURL:    state.OutgoingURL,
 				apiKey:         state.ApiKey,
 				metadata:       state.Metadata,
+				agentBotID:     state.AgentBotID,
 				responseNotice: state.ResponseNotice,
 			})
 		}
@@ -224,6 +226,7 @@ func (s *pipelineService) startDebounce(ctx context.Context, event *model.Messag
 		outgoingURL:    event.OutgoingURL,
 		apiKey:         event.ApiKey,
 		metadata:       event.Metadata,
+		agentBotID:     event.AgentBotID,
 		responseNotice: strings.TrimSpace(event.ResponseNotice),
 	})
 
@@ -239,6 +242,7 @@ func (s *pipelineService) startDebounce(ctx context.Context, event *model.Messag
 		Stage:          model.StageDebounce,
 		CreatedAt:      time.Now(),
 		BotConfig:      event.BotConfig,
+		AgentBotID:     event.AgentBotID,
 		PostbackURL:    event.PostbackURL,
 		OutgoingURL:    event.OutgoingURL,
 		ApiKey:         event.ApiKey,
@@ -272,6 +276,7 @@ func (s *pipelineService) skipDebounce(ctx context.Context, event *model.Message
 		outgoingURL:    event.OutgoingURL,
 		apiKey:         event.ApiKey,
 		metadata:       event.Metadata,
+		agentBotID:     event.AgentBotID,
 		responseNotice: strings.TrimSpace(event.ResponseNotice),
 	})
 
@@ -318,7 +323,7 @@ func (s *pipelineService) skipDebounce(ctx context.Context, event *model.Message
 		"contact_id", event.ContactID,
 		"conversation_id", event.ConversationID,
 	)
-	s.launchAIStage(event.ContactID, event.ConversationID, buffer, atts, event.MessageID)
+	s.launchAIStage(event.ContactID, event.ConversationID, buffer, atts, event.MessageID, []string{event.MessageID})
 	return nil
 }
 
@@ -327,6 +332,12 @@ func (s *pipelineService) resetDebounce(ctx context.Context, event *model.Messag
 		return fmt.Errorf("pipeline.debounce.reset: %w", err)
 	}
 	state.ResponseNotice = appendResponseNotice(state.ResponseNotice, event.ResponseNotice)
+	// Mixed or missing bot identities must never become authority for a batch.
+	// Preserve the text flow, but poison the internal identity until this batch
+	// has completed so future scoped grant issuance fails closed.
+	if state.AgentBotID == "" || state.AgentBotID != event.AgentBotID {
+		state.AgentBotID = ""
+	}
 	if err := s.repo.SetState(ctx, event.ContactID, event.ConversationID, state); err != nil {
 		return fmt.Errorf("pipeline.debounce.update_response_notice: %w", err)
 	}
@@ -334,6 +345,7 @@ func (s *pipelineService) resetDebounce(ctx context.Context, event *model.Messag
 	if value, ok := s.entries.Load(key); ok {
 		if entry, valid := value.(pipelineEntry); valid {
 			entry.responseNotice = state.ResponseNotice
+			entry.agentBotID = state.AgentBotID
 			s.entries.Store(key, entry)
 		}
 	}
@@ -420,13 +432,13 @@ func (s *pipelineService) advanceToAI(contactID, conversationID int64) {
 		"conversation_id", conversationID,
 		"buffer_len", len(buffer),
 	)
-	s.launchAIStage(contactID, conversationID, buffer, atts, state.MessageID)
+	s.launchAIStage(contactID, conversationID, buffer, atts, state.MessageID, messageIDs)
 }
 
 // launchAIStage launches the AI goroutine with the stored pipeline context.
 // Must be called only after pipelineEntry is stored in s.entries (guaranteed by
 // startDebounce/skipDebounce/advanceToAI).
-func (s *pipelineService) launchAIStage(contactID, conversationID int64, buffer string, atts []model.Attachment, messageID string) {
+func (s *pipelineService) launchAIStage(contactID, conversationID int64, buffer string, atts []model.Attachment, messageID string, sourceMessageIDs []string) {
 	key := pairKey(contactID, conversationID)
 	v, ok := s.entries.Load(key)
 	if !ok {
@@ -445,13 +457,14 @@ func (s *pipelineService) launchAIStage(contactID, conversationID int64, buffer 
 		)
 		return
 	}
-	go s.runAIStage(entry.ctx, contactID, conversationID, buffer, atts, entry.cfg, entry.postbackURL, messageID)
+	go s.runAIStage(entry, contactID, conversationID, buffer, atts, messageID, append([]string(nil), sourceMessageIDs...))
 }
 
 // runAIStage is the AI stage goroutine body. ctx is pipelineEntry.ctx — cancelled by
 // Process when a new message arrives for the same pair.
-func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversationID int64, buffer string, atts []model.Attachment, cfg model.BotConfig, postbackURL, messageID string) {
+func (s *pipelineService) runAIStage(entry pipelineEntry, contactID, conversationID int64, buffer string, atts []model.Attachment, messageID string, sourceMessageIDs []string) {
 	defer s.recoverPipeline(contactID, conversationID)
+	ctx, cfg, postbackURL := entry.ctx, entry.cfg, entry.postbackURL
 
 	slog.Info("pipeline.ai.started",
 		"contact_id", contactID,
@@ -459,19 +472,6 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 	)
 	start := time.Now()
 
-	// Retrieve outgoing_url, api_key and metadata from the pipeline entry.
-	key := pairKey(contactID, conversationID)
-	var outgoingURL, apiKey string
-	var metadata map[string]any
-	var responseNotice string
-	if v, ok := s.entries.Load(key); ok {
-		if entry, ok := v.(pipelineEntry); ok {
-			outgoingURL = entry.outgoingURL
-			apiKey = entry.apiKey
-			metadata = entry.metadata
-			responseNotice = entry.responseNotice
-		}
-	}
 	// EVO-2180: forward incoming media (aggregated over the debounce window) so the
 	// adapter can download + base64-encode it into A2A file parts.
 	aiAttachments := make([]aiModel.Attachment, 0, len(atts))
@@ -484,14 +484,16 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 	}
 
 	resp, err := s.aiAdapter.Call(ctx, &aiModel.A2ARequest{
-		OutgoingURL:    outgoingURL,
-		ContactID:      contactID,
-		ConversationID: conversationID,
-		MessageID:      messageID,
-		ApiKey:         apiKey,
-		Message:        buffer,
-		Metadata:       metadata,
-		Attachments:    aiAttachments,
+		OutgoingURL:      entry.outgoingURL,
+		ContactID:        contactID,
+		ConversationID:   conversationID,
+		MessageID:        messageID,
+		SourceMessageIDs: sourceMessageIDs,
+		AgentBotID:       entry.agentBotID,
+		ApiKey:           entry.apiKey,
+		Message:          buffer,
+		Metadata:         entry.metadata,
+		Attachments:      aiAttachments,
 	})
 	if err != nil {
 		switch {
@@ -542,7 +544,7 @@ func (s *pipelineService) runAIStage(ctx context.Context, contactID, conversatio
 		s.sendAIFailureNotice(contactID, conversationID, cfg, postbackURL, errors.New("invalid AI response"), resp.TerminalHandoff)
 		return
 	}
-	resp.Content = appendResponseNotice(resp.Content, responseNotice)
+	resp.Content = appendResponseNotice(resp.Content, entry.responseNotice)
 
 	// Success path — use cleanupCtx() for Redis calls: pipeline ctx may be cancelled.
 	dur := time.Since(start)
@@ -578,7 +580,7 @@ func (s *pipelineService) launchDispatchStage(
 	cfg model.BotConfig,
 	postbackURL string,
 ) {
-	go s.runDispatchStage(ctx, contactID, conversationID, resp.Content, cfg, postbackURL, resp.TerminalHandoff)
+	go s.runDispatchStage(aiModel.WithResponseProvenance(ctx, resp.KnowledgeProvenance), contactID, conversationID, resp.Content, cfg, postbackURL, resp.TerminalHandoff)
 }
 
 // runDispatchStage is the dispatch stage goroutine body. ctx is pipelineEntry.ctx — cancelled by
