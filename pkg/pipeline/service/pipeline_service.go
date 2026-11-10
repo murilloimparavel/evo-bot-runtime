@@ -23,7 +23,7 @@ import (
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/repository"
 )
 
-// PipelineService orchestrates the per-pair pipeline state machine.
+// PipelineService durably accepts events and runs recoverable per-conversation work.
 type PipelineService interface {
 	Process(ctx context.Context, event *model.MessageEvent) error
 	Cancel(contactID, conversationID int64) error
@@ -86,6 +86,9 @@ func legacyDebounceMessageID(pair model.PairID, createdAt time.Time) string {
 	return stableMessageID([]string{fmt.Sprintf("legacy:%d:%d:%d", pair.ContactID, pair.ConversationID, createdAt.UnixNano())})
 }
 
+// pipelineService is the legacy state machine retained for regression coverage.
+// Production construction below selects durableService; the two consumers must
+// never run simultaneously against the same incoming conversation feed.
 type pipelineService struct {
 	repo        repository.PipelineRepository
 	debounce    debounceIface.DebounceEngine
@@ -97,21 +100,21 @@ type pipelineService struct {
 	stopOnce    sync.Once     // ensures stopCh is closed exactly once
 }
 
-// NewPipelineService constructs the service. Returns interface (GEAR R03).
+// NewPipelineService constructs the durable service. The debounce parameter is
+// retained for source compatibility during cutover; durable turns own debounce.
 func NewPipelineService(
 	repo repository.PipelineRepository,
 	debounce debounceIface.DebounceEngine,
 	aiAdapter aiIface.AIAdapter,
 	dispatchEng dispatchIface.DispatchEngine,
 ) PipelineService {
-	return &pipelineService{
-		repo:        repo,
-		debounce:    debounce,
-		aiAdapter:   aiAdapter,
-		dispatchEng: dispatchEng,
-		stopCh:      make(chan struct{}),
-		stoppedCh:   make(chan struct{}),
+	durable, ok := repo.(repository.DurableRepository)
+	if !ok {
+		panic("pipeline repository must support durable acceptance")
 	}
+	service := newDurableService(durable, aiAdapter, dispatchEng)
+	service.legacy = repo
+	return service
 }
 
 // Start recovers in-progress debounce pairs from Redis, then launches the single

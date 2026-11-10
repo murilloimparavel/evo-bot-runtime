@@ -35,6 +35,7 @@ type DispatchEngine interface {
 
 // postbackRequest is the JSON body for each HTTP POST to the postback endpoint.
 type postbackRequest struct {
+	RuntimeDeliveryID   string               `json:"runtime_delivery_id,omitempty"`
 	Content             string               `json:"content"`
 	KnowledgeProvenance string               `json:"knowledge_provenance,omitempty"`
 	MessageType         string               `json:"message_type"`
@@ -121,7 +122,7 @@ func (d *dispatchEngineImpl) Dispatch(
 		if len(parts) == 1 && part == content && len(atts) == 0 {
 			proof = aiModel.ResponseProvenance(ctx)
 		}
-		if err := d.sendPart(ctx, postbackURL, part, nil, terminalHandoff, proof); err != nil {
+		if err := d.sendPart(ctx, postbackURL, part, nil, terminalHandoff, proof, fmt.Sprint(i)); err != nil {
 			return fmt.Errorf("pipeline.dispatch.send[%d]: %w", i, err)
 		}
 
@@ -148,7 +149,7 @@ func (d *dispatchEngineImpl) Dispatch(
 			return brtErrors.ErrDispatchInterrupted
 		default:
 		}
-		if err := d.sendPart(ctx, postbackURL, "", atts, terminalHandoff, ""); err != nil {
+		if err := d.sendPart(ctx, postbackURL, "", atts, terminalHandoff, "", "media"); err != nil {
 			return fmt.Errorf("pipeline.dispatch.send[media]: %w", err)
 		}
 	}
@@ -165,8 +166,19 @@ func (d *dispatchEngineImpl) Dispatch(
 
 // sendPart sends a single content part (and optional media attachments) to the
 // postback URL.
-func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content string, atts []postbackAttachment, force bool, proof string) error {
+func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content string, atts []postbackAttachment, force bool, proof string, segment ...string) error {
+	info := delivery(ctx)
+	if info.guard != nil {
+		if err := info.guard(ctx); err != nil {
+			return err
+		}
+	}
+	deliveryID := ""
+	if info.id != "" && len(segment) > 0 {
+		deliveryID = info.id + ":" + segment[0]
+	}
 	body, err := json.Marshal(postbackRequest{
+		RuntimeDeliveryID:   deliveryID,
 		Content:             content,
 		KnowledgeProvenance: proof,
 		MessageType:         "outgoing",

@@ -271,7 +271,7 @@ func (h *harness) event(contactID, convID int64, content string, debounceTime in
 		AgentBotID:     "e2e-bot",
 		ContactID:      contactID,
 		ConversationID: convID,
-		MessageID:      "e2e-msg-1",
+		MessageID:      fmt.Sprintf("e2e-msg-%x", []byte(content)),
 		MessageContent: content,
 		PostbackURL:    h.pbServer.URL,
 		OutgoingURL:    h.aiServer.URL,
@@ -345,28 +345,23 @@ func TestE2E_DebounceAggregation(t *testing.T) {
 		json.NewEncoder(w).Encode(a2aResponse("ok")) //nolint:errcheck
 	})
 
-	h.postEvent(t, h.event(contactID, convID, "hello", 1)).Body.Close() // starts 1s debounce
-
-	// Wait for the first Process() goroutine to acquire the Redlock and enter
-	// StageDebounce before sending the second event. Both goroutines race for the
-	// lock (WithTries(1)); the second fails immediately if it tries while the first
-	// still holds it. 50ms is well above the Redis round-trip needed to complete
-	// startDebounce (acquire → append → setTimer → setState → release).
-	time.Sleep(50 * time.Millisecond)
-
-	h.postEvent(t, h.event(contactID, convID, "world", 1)).Body.Close() // resets timer
+	// Sequential HTTP acceptance must be sufficient; there is no sleep to let
+	// an in-memory goroutine finish before the next message arrives.
+	h.postEvent(t, h.event(contactID, convID, "values?", 1)).Body.Close()
+	h.postEvent(t, h.event(contactID, convID, "five adults", 1)).Body.Close()
+	h.postEvent(t, h.event(contactID, convID, "20/11 to 23/11", 1)).Body.Close()
 
 	select {
 	case msg := <-aiReceived:
-		if msg != "hello\n\nworld" {
-			t.Errorf("AI received message = %q, want %q", msg, "hello\n\nworld")
+		if msg != "values?\n\nfive adults\n\n20/11 to 23/11" {
+			t.Errorf("AI received message = %q, want %q", msg, "values?\n\nfive adults\n\n20/11 to 23/11")
 		}
 	case <-time.After(4 * time.Second):
 		t.Fatal("timed out waiting for AI call after debounce expiry")
 	}
 
 	if n := h.aiServer.calls.Load(); n != 1 {
-		t.Errorf("AI called %d times, want 1 (two events must produce one aggregated call)", n)
+		t.Errorf("AI called %d times, want 1 (three events must produce one aggregated call)", n)
 	}
 }
 
@@ -435,7 +430,7 @@ func TestE2E_AIInterruption(t *testing.T) {
 
 	// event2: cancels event1's pipeline context and starts a new pipeline.
 	h.postEvent(t, h.event(contactID, convID, "event2", 0)).Body.Close()
-	h.pbServer.waitForCall(t, 2*time.Second)
+	h.pbServer.waitForCall(t, 3*time.Second)
 
 	// Unblock the first handler now that we have the postback — prevents deadlock
 	// if t.Cleanup fires before we reach this point.
@@ -487,11 +482,10 @@ func TestE2E_ResponseTime(t *testing.T) {
 // StageIncoming to Redis (durability), so the event is not lost; it is processed
 // once the lock is released.
 //
-// This test exercises the Redlock under real goroutine pressure. Both goroutines
-// are released simultaneously via a ready channel. Each fires an HTTP request to
-// the live gin server. The fast AI mock returns immediately so at least one
-// pipeline completes within the timeout. The invariant is: postback count ≤ 1.
-func TestE2E_ExactlyOnce_ConcurrentEvents(t *testing.T) {
+// Concurrent deliveries of the same original ID must append one event and
+// produce one response. This checks idempotent consumption, not exactly-once
+// external effects.
+func TestE2E_DuplicateConcurrentEvents(t *testing.T) {
 	h := newHarness(t)
 	contactID, convID := nextPair()
 
@@ -516,15 +510,11 @@ func TestE2E_ExactlyOnce_ConcurrentEvents(t *testing.T) {
 	close(ready)
 	wg.Wait()
 
-	// The lock winner runs the full pipeline and fires exactly one postback.
-	// The lock loser returns immediately with ErrLockFailed and produces no postback.
-	// Both handlers write StageIncoming before their goroutines start, so the
-	// lock race always resolves before either pipeline can complete — guaranteeing
-	// exactly one pipeline runs and exactly one postback is delivered.
+	// Both requests are durably accepted; their stable ID deduplicates them.
 	h.pbServer.waitForCall(t, 2*time.Second)
 
 	if n := h.pbServer.callCount(); n != 1 {
-		t.Errorf("postback called %d times, want exactly 1 (exactly-once guarantee violated)", n)
+		t.Errorf("postback called %d times, want 1 (duplicate event must be deduplicated)", n)
 	}
 }
 
@@ -594,20 +584,12 @@ func TestE2E_PipelineIsolation(t *testing.T) {
 		t.Error("pair A got no failure notice: its customer is left in silence (CRM-236)")
 	}
 
-	// Pair A must leave no state in Redis after its AI error. Its cleanup runs in
-	// its own goroutine, so poll instead of racing pair B's postback.
-	stateKey := fmt.Sprintf("bot_runtime:state:%d:%d", pairAContact, pairAConv)
-	cleared := false
-	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
-		if h.rdb.Exists(context.Background(), stateKey).Val() == 0 {
-			cleared = true
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	// Pair A remains durably pending for retry; pair B's success is independent.
+	stateKey := fmt.Sprintf("bot_runtime:durable:%d:%d", pairAContact, pairAConv)
+	if h.rdb.Exists(context.Background(), stateKey).Val() != 1 {
+		t.Error("failed pair A lost recoverable work")
 	}
-	if !cleared {
-		t.Errorf("pair A state key still exists in Redis after AI error — state leak")
-	}
+
 }
 
 // TestE2E_DispatchSegmentation verifies that BotConfig segmentation fields are
@@ -808,41 +790,36 @@ func TestE2E_RecoveryAfterRestart(t *testing.T) {
 	}
 }
 
-// TestE2E_PostbackFailure_StateCleared verifies that when the postback endpoint
-// returns a non-2xx status, the pipeline clears its Redis state and does not retry.
-//
-// dispatch_engine_test.go covers the non-2xx error return in isolation.
-// This test verifies that runDispatchStage handles the error correctly end-to-end:
-// the state key is removed from Redis (no leak), and there is no retry attempt.
-func TestE2E_PostbackFailure_StateCleared(t *testing.T) {
+// Postback failures preserve saved output and retry the same segment identity.
+func TestE2E_PostbackFailure_RetriesSavedResponse(t *testing.T) {
 	h := newHarness(t)
 	contactID, convID := nextPair()
-
 	h.aiServer.setHandler(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(a2aResponse("response")) //nolint:errcheck
+		json.NewEncoder(w).Encode(a2aResponse("response"))
 	})
-
-	// Postback server returns 500 — dispatch should error and clear state.
-	h.pbServer.setHandler(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	var attempts atomic.Int32
+	h.pbServer.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "temporary failure", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	})
-
-	resp := h.postEvent(t, h.event(contactID, convID, "msg", 0))
-	resp.Body.Close()
-
-	// Wait for dispatch to attempt the postback (records the call, then returns 500).
-	h.pbServer.waitForCall(t, 3*time.Second)
-
-	// Allow time for sendPart to read the response, propagate the error through
-	// runDispatchStage, and ClearState to complete in Redis.
-	time.Sleep(200 * time.Millisecond)
-
-	stateKey := fmt.Sprintf("bot_runtime:state:%d:%d", contactID, convID)
-	if n := h.rdb.Exists(context.Background(), stateKey).Val(); n != 0 {
-		t.Errorf("state key still exists after postback failure — state leaked in Redis")
+	h.postEvent(t, h.event(contactID, convID, "msg", 0)).Body.Close()
+	h.pbServer.waitForNCalls(t, 2, 5*time.Second)
+	bodies := h.pbServer.allBodies()
+	var first, second map[string]any
+	if err := json.Unmarshal(bodies[0], &first); err != nil {
+		t.Fatal(err)
 	}
-	if n := h.pbServer.callCount(); n != 1 {
-		t.Errorf("postback called %d times, want 1 (no retry on failure)", n)
+	if err := json.Unmarshal(bodies[1], &second); err != nil {
+		t.Fatal(err)
+	}
+	if first["runtime_delivery_id"] == "" || first["runtime_delivery_id"] != second["runtime_delivery_id"] {
+		t.Fatal("retry changed delivery identity")
+	}
+	if n := h.aiServer.calls.Load(); n != 1 {
+		t.Fatalf("AI regenerated on postback retry: %d", n)
 	}
 }
