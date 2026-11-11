@@ -1,0 +1,66 @@
+name: Publish immutable knowledge runtime image
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Approved full commit SHA from this repository
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'murilloimparavel/evo-bot-runtime' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_SHA: ${{ inputs.release_sha || github.event.pull_request.head.sha }}
+      IMAGE: ghcr.io/murilloimparavel/evo-bot-runtime
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.release_sha || github.event.pull_request.head.sha }}
+      - name: Validate immutable revision
+        run: |
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test adapter and provenance dispatch
+        run: go test ./pkg/ai/service ./pkg/dispatch/service
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1
+        id: image
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: GIT_SHA=${{ env.RELEASE_SHA }}
+          tags: ${{ env.IMAGE }}:sha-${{ env.RELEASE_SHA }}
+          provenance: mode=max
+          sbom: true
+      - name: Verify published revision
+        env:
+          RELEASE_IMAGE: ${{ env.IMAGE }}@${{ steps.image.outputs.digest }}
+        run: |
+          docker pull "$RELEASE_IMAGE"
+          test "$(docker run --rm --entrypoint cat "$RELEASE_IMAGE" /app/.git_sha)" = "$RELEASE_SHA"

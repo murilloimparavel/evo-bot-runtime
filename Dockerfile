@@ -7,11 +7,16 @@ RUN go mod download
 
 COPY . .
 RUN go build -o bin/evo-bot-runtime ./cmd/server
+RUN go build -o bin/reconcile ./cmd/reconcile
 
 FROM alpine:3.20
 
 WORKDIR /app
 COPY --from=builder /app/bin/evo-bot-runtime .
+COPY --from=builder /app/bin/reconcile .
+ARG GIT_SHA=unknown
+RUN printf '%s\n' "$GIT_SHA" > /app/.git_sha
+LABEL org.opencontainers.image.revision=$GIT_SHA
 
 EXPOSE 8080
 

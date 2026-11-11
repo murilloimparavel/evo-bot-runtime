@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,28 @@ import (
 	aiModel "github.com/EvolutionAPI/evo-bot-runtime/pkg/ai/model"
 	aiService "github.com/EvolutionAPI/evo-bot-runtime/pkg/ai/service"
 )
+
+func TestCall_DoesNotExposeSourceMessageIDsInA2ABody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		if strings.Contains(string(body), "private-source-message") {
+			t.Error("source message ID leaked into A2A JSON")
+		}
+		if strings.Contains(string(body), "private-bot-id") {
+			t.Error("internal bot ID leaked into A2A JSON")
+		}
+		_ = json.NewEncoder(w).Encode(aiModel.A2AResponse{Result: &aiModel.A2AResult{Artifacts: []aiModel.A2AArtifact{{Parts: []aiModel.A2APart{{Type: "text", Text: "ok"}}}}}})
+	}))
+	defer server.Close()
+	adapter := aiService.NewAIAdapter(30, 0, 0)
+	_, err := adapter.Call(context.Background(), &aiModel.A2ARequest{OutgoingURL: server.URL, Message: "oi", SourceMessageIDs: []string{"private-source-message"}, AgentBotID: "private-bot-id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 // crmMetadata builds the nested CRM metadata map the Rails AgentBotListener sends,
 // carrying the conversation UUID at evoai_crm_data.conversation.id and the contact
