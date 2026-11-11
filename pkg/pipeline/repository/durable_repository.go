@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/model"
@@ -60,13 +61,14 @@ func (r *redisPipelineRepository) AcceptEvent(ctx context.Context, e *model.Mess
  if redis.call('EXISTS',KEYS[2]) == 1 then return 0 end
  local raw=redis.call('GET',KEYS[1]); local t
  if raw then t=cjson.decode(raw) else t={key=KEYS[1],revision=0,events={}} end
- table.insert(t.events,cjson.decode(ARGV[1])); t.revision=t.revision+1
+ local event=cjson.decode(ARGV[1]); event.contact_id=ARGV[3]; event.conversation_id=ARGV[4]
+ table.insert(t.events,event); t.revision=t.revision+1
  t.phase='waiting'; t.token=''; t.due_at=tonumber(ARGV[2]); t.attempts=0
  t.content=nil; t.provenance=nil; t.terminal_handoff=nil; t.failure_notified=nil
  redis.call('SET',KEYS[1],cjson.encode(t))
  redis.call('SET',KEYS[2],'1')
  redis.call('ZADD',KEYS[3],ARGV[2],KEYS[1]); return 1
- `, []string{key, receipt, readyTurnsKey}, raw, time.Now().Add(time.Duration(e.BotConfig.DebounceTime)*time.Second).UnixMilli()).Result()
+ `, []string{key, receipt, readyTurnsKey}, raw, time.Now().Add(time.Duration(e.BotConfig.DebounceTime)*time.Second).UnixMilli(), strconv.FormatInt(e.ContactID, 10), strconv.FormatInt(e.ConversationID, 10)).Result()
 	return err
 }
 func (r *redisPipelineRepository) ReadyTurns(ctx context.Context, limit int) ([]string, error) {
@@ -76,6 +78,13 @@ func (r *redisPipelineRepository) ClaimTurn(ctx context.Context, key, token stri
 	raw, err := r.rdb.Eval(ctx, `
  local raw=redis.call('GET',KEYS[1]); if not raw then redis.call('ZREM',KEYS[2],KEYS[1]); return '' end
  local t=cjson.decode(raw); if t.due_at>tonumber(ARGV[1]) then return '' end
+ -- Old turns may contain rounded identifiers and stale customer messages.
+ -- Hold them for explicit reconciliation, never replay them automatically.
+ for _, e in ipairs(t.events) do
+   if type(e.contact_id)~='string' or type(e.conversation_id)~='string' then
+     redis.call('ZADD',KEYS[2],tonumber(ARGV[1])+60000,KEYS[1]); return 'legacy'
+   end
+ end
  if not redis.call('SET',KEYS[3],ARGV[2],'NX','PX',ARGV[4]) then
  redis.call('ZADD',KEYS[2],tonumber(ARGV[1])+math.max(1,redis.call('PTTL',KEYS[3])),KEYS[1]); return '' end
  t.token=ARGV[2]; t.due_at=tonumber(ARGV[3]); t.attempts=t.attempts+1
@@ -87,9 +96,50 @@ func (r *redisPipelineRepository) ClaimTurn(ctx context.Context, key, token stri
 	if raw == "" {
 		return nil, nil
 	}
-	var t DurableTurn
-	err = json.Unmarshal([]byte(raw), &t)
-	return &t, err
+	if raw == "legacy" {
+		return nil, fmt.Errorf("legacy turn requires reconciliation")
+	}
+	return decodeDurableTurn([]byte(raw))
+}
+
+// Redis Lua cjson represents numbers as doubles. Store identifiers as decimal
+// strings in durable payloads, while retaining the numeric external API.
+func decodeDurableTurn(raw []byte) (*DurableTurn, error) {
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &document); err != nil {
+		return nil, err
+	}
+	var events []map[string]json.RawMessage
+	if err := json.Unmarshal(document["events"], &events); err != nil {
+		return nil, err
+	}
+	for _, event := range events {
+		for _, field := range []string{"contact_id", "conversation_id"} {
+			var value string
+			if err := json.Unmarshal(event[field], &value); err != nil {
+				return nil, fmt.Errorf("invalid durable %s", field)
+			}
+			id, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || id <= 0 {
+				return nil, fmt.Errorf("invalid durable %s", field)
+			}
+			event[field] = json.RawMessage(strconv.FormatInt(id, 10))
+		}
+	}
+	encoded, err := json.Marshal(events)
+	if err != nil {
+		return nil, err
+	}
+	document["events"] = encoded
+	raw, err = json.Marshal(document)
+	if err != nil {
+		return nil, err
+	}
+	var turn DurableTurn
+	if err := json.Unmarshal(raw, &turn); err != nil {
+		return nil, err
+	}
+	return &turn, nil
 }
 
 const guardTurn = `

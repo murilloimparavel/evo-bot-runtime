@@ -6,8 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/EvolutionAPI/evo-bot-runtime/internal/testhelpers"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/model"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/repository"
+	"github.com/redis/go-redis/v9"
 )
 
 func durableRepo(t *testing.T) repository.DurableRepository {
@@ -15,6 +17,70 @@ func durableRepo(t *testing.T) repository.DurableRepository {
 	r, done := setupTestRepo(t)
 	t.Cleanup(done)
 	return r.(repository.DurableRepository)
+}
+
+func TestDurablePreservesLargeIDsAcrossRedisScripts(t *testing.T) {
+	r := durableRepo(t)
+	ctx := context.Background()
+	e := eventFor(6049302487801707118, "large-id", "hello")
+	e.ConversationID = 4729
+	key := fmt.Sprintf("bot_runtime:durable:%d:%d", e.ContactID, e.ConversationID)
+	defer r.CancelTurn(ctx, e.ContactID, e.ConversationID)
+	if err := r.AcceptEvent(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := r.ClaimTurn(ctx, key, "owner", time.Second)
+	if err != nil || turn == nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if turn.Events[0].ContactID != e.ContactID || turn.Events[0].ConversationID != e.ConversationID {
+		t.Fatal("IDs changed")
+	}
+	if ok, err := r.RenewTurn(ctx, turn, time.Second); err != nil || !ok {
+		t.Fatalf("renew: %v", err)
+	}
+	if err := r.RetryTurn(ctx, turn, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReleaseTurn(ctx, turn); err != nil {
+		t.Fatal(err)
+	}
+	turn, err = r.ClaimTurn(ctx, key, "next", time.Second)
+	if err != nil || turn == nil || turn.Events[0].ContactID != e.ContactID {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if err := r.ReleaseTurn(ctx, turn); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDurableLegacyTurnIsHeldForReconciliation(t *testing.T) {
+	r := durableRepo(t)
+	ctx := context.Background()
+	client := redis.NewClient(testhelpers.RedisOptions())
+	defer client.Close()
+	const key = "bot_runtime:durable:6049302487801707118:4730"
+	defer r.CancelTurn(ctx, 6049302487801707118, 4730)
+	raw := `{"key":"` + key + `","revision":1,"phase":"waiting","due_at":0,"attempts":22,"events":[{"contact_id":6.0493024878017e+18,"conversation_id":4729,"message_id":"old"}]}`
+	if err := client.Set(ctx, key, raw, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ZAdd(ctx, "bot_runtime:durable:ready", redis.Z{Score: 0, Member: key}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := r.ClaimTurn(ctx, key, "owner", time.Second)
+	if err == nil || turn != nil {
+		t.Fatal("legacy turn must be held")
+	}
+	if got, err := client.Get(ctx, key).Result(); err != nil || got != raw {
+		t.Fatal("legacy payload changed")
+	}
+	if client.Exists(ctx, key+":lease").Val() != 0 {
+		t.Fatal("legacy turn acquired a lease")
+	}
+	if client.ZScore(ctx, "bot_runtime:durable:ready", key).Val() <= float64(time.Now().UnixMilli()) {
+		t.Fatal("legacy retry was not delayed")
+	}
 }
 func eventFor(c int64, id, text string) *model.MessageEvent {
 	return &model.MessageEvent{ContactID: c, ConversationID: c, AgentBotID: "bot", MessageID: id, MessageContent: text, PostbackURL: "http://crm/postback", ApiKey: "private-test-token", BotConfig: model.BotConfig{DebounceTime: 0}}

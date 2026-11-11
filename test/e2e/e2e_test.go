@@ -324,6 +324,29 @@ func TestE2E_FullHappyPath(t *testing.T) {
 	}
 }
 
+func TestE2E_LargeContactIDProducesOneResponse(t *testing.T) {
+	h := newHarness(t)
+	e := h.event(6049302487801707118, 4729, "large contact id", 0)
+	resp := h.postEvent(t, e)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", resp.StatusCode)
+	}
+	h.pbServer.waitForCall(t, 5*time.Second)
+	if n := h.aiServer.calls.Load(); n != 1 {
+		t.Fatalf("AI calls = %d, want 1", n)
+	}
+	if n := h.pbServer.callCount(); n != 1 {
+		t.Fatalf("postback calls = %d, want 1", n)
+	}
+	resp = h.postEvent(t, e)
+	resp.Body.Close()
+	time.Sleep(500 * time.Millisecond)
+	if n := h.pbServer.callCount(); n != 1 {
+		t.Fatalf("duplicate postback calls = %d", n)
+	}
+}
+
 // TestE2E_DebounceAggregation verifies that two events within the debounce window
 // are concatenated with \n\n and reach the AI as a single aggregated message.
 // pipeline_service_test.go verifies state transitions but never checks the content

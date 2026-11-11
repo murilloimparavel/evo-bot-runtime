@@ -95,7 +95,12 @@ func (s *durableService) poll() {
 			claimCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 			t, err := s.repo.ClaimTurn(claimCtx, key, hex.EncodeToString(tokenBytes), turnLease)
 			cancel()
-			if err != nil || t == nil {
+			if err != nil {
+				slog.Error("pipeline.turn.claim_failed", "key", key, "error", err)
+				<-s.slots
+				continue
+			}
+			if t == nil {
 				<-s.slots
 				continue
 			}
