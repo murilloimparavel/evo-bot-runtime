@@ -50,3 +50,40 @@ jobs:
         # All Redis-backed packages use isolated logical DBs, but several unit
         # packages share DB 15; serialize packages to avoid cross-package flushes.
         run: go test -p 1 ./...
+
+  pr-ready:
+    name: PR ready
+    if: always()
+    needs: [test, workflow-lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful validation
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY_GATE'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          failed = [job for job, result in results.items() if result['result'] != 'success']
+          if failed:
+              raise SystemExit('Required validation did not succeed: ' + ', '.join(failed))
+          print('All required PR checks passed')
+          PY_GATE
+
+  workflow-lint:
+    name: Validate GitHub Actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
+        with:
+          go-version: '1.24.4'
+          cache: false
+      - name: Install pinned actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+      - name: Validate workflows
+        run: actionlint -shellcheck= -pyflakes=
