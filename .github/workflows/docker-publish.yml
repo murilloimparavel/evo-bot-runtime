@@ -76,6 +76,8 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
+          build-args: |
+            GIT_SHA=${{ github.sha }}
           provenance: mode=max
           sbom: true
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true
