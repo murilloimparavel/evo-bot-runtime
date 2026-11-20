@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	brtErrors "github.com/EvolutionAPI/evo-bot-runtime/internal/errors"
 	aiModel "github.com/EvolutionAPI/evo-bot-runtime/pkg/ai/model"
 	aiIface "github.com/EvolutionAPI/evo-bot-runtime/pkg/ai/service"
 	dispatchIface "github.com/EvolutionAPI/evo-bot-runtime/pkg/dispatch/service"
@@ -181,7 +182,7 @@ func (s *durableService) run(t *repository.DurableTurn) {
 	if t.Phase != "dispatch" {
 		response, err := s.ai.Call(ctx, &aiModel.A2ARequest{OutgoingURL: last.OutgoingURL, ContactID: last.ContactID, ConversationID: last.ConversationID, MessageID: batchID, SourceMessageIDs: ids, AgentBotID: last.AgentBotID, ApiKey: last.ApiKey, Message: strings.Join(texts, "\n\n"), Metadata: last.Metadata, Attachments: atts})
 		if err != nil || response == nil || !validAIResponse(response.Content) {
-			slog.Warn("pipeline.turn.ai_failed", "conversation_id", last.ConversationID, "revision", t.Revision)
+			slog.Warn("pipeline.turn.ai_failed", "conversation_id", last.ConversationID, "revision", t.Revision, "reason", aiFailureReason(err, response))
 			s.failureNotice(ctx, t, last, batchID)
 			s.retry(t)
 			return
@@ -242,6 +243,43 @@ func (s *durableService) run(t *repository.DurableTurn) {
 		slog.Info("pipeline.turn.completed", "conversation_id", last.ConversationID, "revision", t.Revision, "source_message_ids", ids)
 	}
 }
+
+// aiFailureReason returns fixed labels only. Raw errors can contain URLs or credentials.
+func aiFailureReason(err error, response *aiModel.NormalizedResponse) string {
+	if err == nil {
+		if response == nil {
+			return "empty_response"
+		}
+		return "invalid_response"
+	}
+	if errors.Is(err, brtErrors.ErrAITimeout) || errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, brtErrors.ErrPipelineCancelled) || errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	text := err.Error()
+	var status int
+	if _, scanErr := fmt.Sscanf(text, "pipeline.ai.status: unexpected %d from AI Processor", &status); scanErr == nil && status >= 100 && status <= 599 {
+		return fmt.Sprintf("processor_http_%d", status)
+	}
+	for _, item := range []struct{ prefix, reason string }{
+		{"pipeline.ai.knowledge_pilot_unavailable", "knowledge_pilot_unavailable"},
+		{"pipeline.ai.knowledge_context_unavailable", "knowledge_context_unavailable"},
+		{"pipeline.ai.knowledge_grant_unavailable", "knowledge_grant_unavailable"},
+		{"pipeline.ai.http:", "processor_network_error"},
+		{"pipeline.ai.status:", "processor_http_error"},
+		{"pipeline.ai.decode:", "processor_response_decode_error"},
+		{"pipeline.ai.new_request:", "processor_request_error"},
+		{"pipeline.ai.marshal:", "request_serialization_error"},
+	} {
+		if strings.HasPrefix(text, item.prefix) {
+			return item.reason
+		}
+	}
+	return "unclassified_error"
+}
+
 func (s *durableService) retry(t *repository.DurableTurn) {
 	delay := time.Second * time.Duration(1<<min(t.Attempts, 6))
 	c, done := cleanupCtx()
