@@ -230,3 +230,23 @@ func TestDurableStaleHandoffDoesNotRetry(t *testing.T) {
 		t.Fatalf("stale handoff retried %d times", calls.Load())
 	}
 }
+
+func TestAIFailureReasonUsesSafeDiagnosticCategories(t *testing.T) {
+	cases := []struct {
+		err      error
+		response *aiModel.NormalizedResponse
+		want     string
+	}{
+		{nil, nil, "empty_response"},
+		{nil, &aiModel.NormalizedResponse{}, "invalid_response"},
+		{errors.New("pipeline.ai.knowledge_pilot_unavailable"), nil, "knowledge_pilot_unavailable"},
+		{errors.New("pipeline.ai.http: secret-url-and-token"), nil, "processor_network_error"},
+		{errors.New("pipeline.ai.status: unexpected 503 from AI Processor"), nil, "processor_http_503"},
+		{errors.New("sensitive-customer-data"), nil, "unclassified_error"},
+	}
+	for _, tc := range cases {
+		if got := aiFailureReason(tc.err, tc.response); got != tc.want {
+			t.Fatalf("got %q, want %q", got, tc.want)
+		}
+	}
+}
