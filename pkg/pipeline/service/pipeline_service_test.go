@@ -896,6 +896,125 @@ func TestPipeline_DispatchError_ClearsState(t *testing.T) {
 // debounce buffer in Redis → A2ARequest. The adapter-level test proves the file
 // part is built from an A2ARequest; this one proves the A2ARequest actually gets
 // the media, which is the seam a refactor would silently drop.
+func TestProcess_PreservesRealMessageIDsAcrossDebounce(t *testing.T) {
+	got := make(chan *aiModel.A2ARequest, 1)
+	ai := &mockAIAdapter{callFn: func(_ context.Context, req *aiModel.A2ARequest) (*aiModel.NormalizedResponse, error) {
+		got <- req
+		return &aiModel.NormalizedResponse{Content: "ok"}, nil
+	}}
+	svc, _ := setupSvcWithAI(t, ai)
+	ctx := context.Background()
+	clearPair(t, svc, 2182)
+	for _, id := range []string{"real-message-1", "real-message-2"} {
+		event := &model.MessageEvent{ContactID: 2182, ConversationID: 2182, MessageID: id, AgentBotID: "trusted-bot-id",
+			MessageContent: "hello", BotConfig: model.BotConfig{DebounceTime: 1}}
+		if err := svc.Process(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state, err := svc.repo.GetState(ctx, 2182, 2182)
+	if err != nil || state == nil || state.AgentBotID != "trusted-bot-id" {
+		t.Fatalf("persisted bot identity missing before restart: state=%+v err=%v", state, err)
+	}
+	if err := svc.repo.DeleteTimer(ctx, 2182, 2182); err != nil {
+		t.Fatal(err)
+	}
+	// A new service has no entries and must reconstruct them from Redis.
+	restarted, _ := setupSvcWithAI(t, ai)
+	if err := restarted.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case req := <-got:
+		if req.AgentBotID != "trusted-bot-id" {
+			t.Fatalf("agent bot id = %q", req.AgentBotID)
+		}
+		if len(req.SourceMessageIDs) != 2 || req.SourceMessageIDs[0] != "real-message-1" || req.SourceMessageIDs[1] != "real-message-2" {
+			t.Fatalf("source message IDs = %v", req.SourceMessageIDs)
+		}
+		if req.MessageID == req.SourceMessageIDs[0] || req.MessageID == req.SourceMessageIDs[1] {
+			t.Fatal("idempotency ID must remain synthetic for aggregated messages")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("AI adapter was never called")
+	}
+}
+
+func TestAIStageUsesCapturedIdentityAfterEntryReplacement(t *testing.T) {
+	got := make(chan *aiModel.A2ARequest, 1)
+	ai := &mockAIAdapter{callFn: func(_ context.Context, req *aiModel.A2ARequest) (*aiModel.NormalizedResponse, error) {
+		got <- req
+		return nil, brtErrors.ErrPipelineCancelled
+	}}
+	svc, _ := setupSvcWithAI(t, ai)
+	ctx := context.Background()
+	old := pipelineEntry{ctx: ctx, agentBotID: "old-bot", outgoingURL: "old-url", apiKey: "old-key", metadata: map[string]any{"batch": "old"}}
+	svc.entries.Store(pairKey(2190, 2190), pipelineEntry{ctx: ctx, agentBotID: "new-bot", outgoingURL: "new-url", apiKey: "new-key", metadata: map[string]any{"batch": "new"}})
+	svc.runAIStage(old, 2190, 2190, "old message", nil, "old-message", []string{"old-source"})
+	req := <-got
+	if req.AgentBotID != "old-bot" || req.OutgoingURL != "old-url" || req.ApiKey != "old-key" || req.Metadata["batch"] != "old" || req.SourceMessageIDs[0] != "old-source" {
+		t.Fatalf("request mixed data from different turns: %+v", req)
+	}
+}
+
+func TestProcess_MixedBotsInvalidateDebounceIdentity(t *testing.T) {
+	got := make(chan *aiModel.A2ARequest, 1)
+	ai := &mockAIAdapter{callFn: func(_ context.Context, req *aiModel.A2ARequest) (*aiModel.NormalizedResponse, error) {
+		got <- req
+		return &aiModel.NormalizedResponse{Content: "ok"}, nil
+	}}
+	svc, _ := setupSvcWithAI(t, ai)
+	ctx := context.Background()
+	clearPair(t, svc, 2191)
+	for i, bot := range []string{"first-bot", "other-bot", "first-bot"} {
+		if err := svc.Process(ctx, &model.MessageEvent{ContactID: 2191, ConversationID: 2191,
+			MessageID: fmt.Sprintf("message-%d", i), AgentBotID: bot, MessageContent: "hello", BotConfig: model.BotConfig{DebounceTime: 1}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state, err := svc.repo.GetState(ctx, 2191, 2191)
+	if err != nil || state.AgentBotID != "" {
+		t.Fatalf("mixed bot identity must be invalidated, got %+v / %v", state, err)
+	}
+	if err := svc.repo.DeleteTimer(ctx, 2191, 2191); err != nil {
+		t.Fatal(err)
+	}
+	svc.advanceToAI(2191, 2191)
+	select {
+	case req := <-got:
+		if req.AgentBotID != "" || len(req.SourceMessageIDs) != 3 {
+			t.Fatalf("mixed identity was not denied: %+v", req)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("AI adapter was never called")
+	}
+}
+
+func TestProcess_PreservesRealMessageIDWithoutDebounce(t *testing.T) {
+	got := make(chan *aiModel.A2ARequest, 1)
+	ai := &mockAIAdapter{callFn: func(_ context.Context, req *aiModel.A2ARequest) (*aiModel.NormalizedResponse, error) {
+		got <- req
+		return &aiModel.NormalizedResponse{Content: "ok"}, nil
+	}}
+	svc, _ := setupSvcWithAI(t, ai)
+	clearPair(t, svc, 2183)
+	if err := svc.Process(context.Background(), &model.MessageEvent{ContactID: 2183, ConversationID: 2183,
+		MessageID: "real-message", AgentBotID: "trusted-bot-id", MessageContent: "hello", BotConfig: model.BotConfig{DebounceTime: 0}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case req := <-got:
+		if req.AgentBotID != "trusted-bot-id" {
+			t.Fatalf("agent bot id = %q", req.AgentBotID)
+		}
+		if len(req.SourceMessageIDs) != 1 || req.SourceMessageIDs[0] != "real-message" || req.MessageID != "real-message" {
+			t.Fatalf("incorrect message IDs: %v / %s", req.SourceMessageIDs, req.MessageID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("AI adapter was never called")
+	}
+}
+
 func TestProcess_ForwardsEventAttachmentsToAIRequest(t *testing.T) {
 	got := make(chan []aiModel.Attachment, 1)
 	capturingAI := &mockAIAdapter{

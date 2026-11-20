@@ -19,9 +19,6 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	rdb := redis.NewClient(testhelpers.RedisOptions())
-	rdb.FlushDB(context.Background())
-	rdb.Close()
 	os.Exit(m.Run())
 }
 

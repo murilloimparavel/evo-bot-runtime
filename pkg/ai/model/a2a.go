@@ -3,14 +3,17 @@ package model
 // A2ARequest carries the data needed to call AI Processor via JSON-RPC 2.0.
 // Fields are NOT serialised directly — the adapter builds the wire format.
 type A2ARequest struct {
-	OutgoingURL    string         // full A2A endpoint URL from agent_bot.outgoing_url
-	ContactID      int64          // used for userId in JSON-RPC params
-	ConversationID int64          // used for contextId in JSON-RPC params
-	MessageID      string         // stable CRM message ID used for retry idempotency
-	ApiKey         string         // used for X-API-Key header (per-event auth)
-	Message        string         // aggregated buffer content (FR-15)
-	Metadata       map[string]any // CRM metadata passed through to processor (tools context)
-	Attachments    []Attachment   // EVO-2180: incoming media to forward as A2A file parts
+	OutgoingURL      string         // full A2A endpoint URL from agent_bot.outgoing_url
+	ContactID        int64          // used for userId in JSON-RPC params
+	ConversationID   int64          // used for contextId in JSON-RPC params
+	MessageID        string         // stable CRM message ID used for retry idempotency
+	SourceMessageIDs []string       // actual CRM IDs for internal authorization; never serialized to A2A
+	AgentBotID       string         // CRM bot identity for internal authorization; never serialized to A2A
+	KnowledgeGrant   string         // short-lived internal header; never serialized to A2A body
+	ApiKey           string         // used for X-API-Key header (per-event auth)
+	Message          string         // aggregated buffer content (FR-15)
+	Metadata         map[string]any // CRM metadata passed through to processor (tools context)
+	Attachments      []Attachment   // EVO-2180: incoming media to forward as A2A file parts
 }
 
 // Attachment is an incoming media item (image/audio/…) the adapter downloads and
@@ -83,6 +86,7 @@ type A2APart struct {
 // NormalizedResponse is the internal format after parsing A2AResponse.
 // No JSON tags — this type never crosses a service boundary.
 type NormalizedResponse struct {
-	Content         string
-	TerminalHandoff bool
+	Content             string
+	TerminalHandoff     bool
+	KnowledgeProvenance string
 }

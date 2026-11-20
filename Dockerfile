@@ -12,6 +12,9 @@ FROM alpine:3.20
 
 WORKDIR /app
 COPY --from=builder /app/bin/evo-bot-runtime .
+ARG GIT_SHA=unknown
+RUN printf '%s\n' "$GIT_SHA" > /app/.git_sha
+LABEL org.opencontainers.image.revision=$GIT_SHA
 
 EXPOSE 8080
 

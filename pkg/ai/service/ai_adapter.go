@@ -101,6 +101,12 @@ func (a *aiAdapter) Call(ctx context.Context, req *model.A2ARequest) (*model.Nor
 
 	// Use the full outgoing_url provided by the CRM (already contains the agent ID)
 	url := req.OutgoingURL
+	protectedDispatch, pilotErr := knowledgeDispatchSelected(url)
+	if pilotErr != nil {
+		return nil, fmt.Errorf("pipeline.ai.knowledge_pilot_unavailable")
+	}
+	// Never carry a grant from a previous invocation into a legacy request.
+	req.KnowledgeGrant = ""
 
 	// Build JSON-RPC 2.0 envelope.
 	// contextId MUST be the conversation UUID, not the numeric display_id: the AI
@@ -119,6 +125,13 @@ func (a *aiAdapter) Call(ctx context.Context, req *model.A2ARequest) (*model.Nor
 	// session and its history exist). Prefer the contact UUID from the CRM metadata;
 	// fall back to the numeric ID only when the metadata is absent (legacy callers).
 	userID := contactUserID(req.Metadata, req.ContactID)
+	if protectedDispatch {
+		var err error
+		contextID, userID, err = resolveKnowledgeIdentity(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("pipeline.ai.knowledge_context_unavailable")
+		}
+	}
 
 	// Message parts: text first, then one file part per downloaded attachment.
 	// EVO-2180: downloads happen ONCE here (before Marshal), so the byte-identical
@@ -145,6 +158,13 @@ func (a *aiAdapter) Call(ctx context.Context, req *model.A2ARequest) (*model.Nor
 	body, err := json.Marshal(rpcReq)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline.ai.marshal: %w", err)
+	}
+	if protectedDispatch {
+		grant, err := requestKnowledgeGrant(ctx, req, body)
+		if err != nil {
+			return nil, fmt.Errorf("pipeline.ai.knowledge_grant_unavailable")
+		}
+		req.KnowledgeGrant = grant
 	}
 
 	// EVO-2167: retry the send on transient failures (5xx/429/network) with
@@ -224,8 +244,17 @@ func (a *aiAdapter) doOnce(
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("X-API-Key", req.ApiKey)
+	if req.KnowledgeGrant != "" {
+		httpReq.Header.Set("X-Knowledge-Grant", req.KnowledgeGrant)
+	}
 
-	resp, err := a.client.Do(httpReq)
+	client := a.client
+	if req.KnowledgeGrant != "" {
+		copyClient := *a.client
+		copyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client = &copyClient
+	}
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, false, brtErrors.ErrPipelineCancelled
@@ -267,7 +296,7 @@ func (a *aiAdapter) doOnce(
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 
-	return &model.NormalizedResponse{Content: content, TerminalHandoff: terminalHandoff}, false, nil
+	return &model.NormalizedResponse{Content: content, TerminalHandoff: terminalHandoff, KnowledgeProvenance: responseProvenance(&a2aResp)}, false, nil
 }
 
 // isRetryableStatus reports whether an HTTP status from the AI Processor is a
@@ -668,4 +697,21 @@ func extractContactUUID(metadata map[string]any) string {
 		return ""
 	}
 	return id
+}
+
+// responseProvenance is forwarded opaquely; only the CRM validates its claims.
+func responseProvenance(resp *model.A2AResponse) string {
+	if resp == nil || resp.Result == nil {
+		return ""
+	}
+	for _, artifact := range resp.Result.Artifacts {
+		for _, part := range artifact.Parts {
+			if part.Type == "data" {
+				if proof, ok := part.Data["knowledge_provenance"].(string); ok && len(proof) <= 32768 {
+					return proof
+				}
+			}
+		}
+	}
+	return ""
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	brtErrors "github.com/EvolutionAPI/evo-bot-runtime/internal/errors"
+	aiModel "github.com/EvolutionAPI/evo-bot-runtime/pkg/ai/model"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/model"
 )
 
@@ -32,13 +34,19 @@ type DispatchEngine interface {
 	) error
 }
 
+var ErrStaleTurn = errors.New("CRM rejected stale turn")
+
 // postbackRequest is the JSON body for each HTTP POST to the postback endpoint.
 type postbackRequest struct {
-	Content     string               `json:"content"`
-	MessageType string               `json:"message_type"`
-	ContentType string               `json:"content_type"`
-	Attachments []postbackAttachment `json:"attachments,omitempty"`
-	Force       bool                 `json:"force,omitempty"`
+	SourceAgentBotID    string               `json:"source_agent_bot_id,omitempty"`
+	SourceMessageIDs    []string             `json:"source_message_ids,omitempty"`
+	RuntimeDeliveryID   string               `json:"runtime_delivery_id,omitempty"`
+	Content             string               `json:"content"`
+	KnowledgeProvenance string               `json:"knowledge_provenance,omitempty"`
+	MessageType         string               `json:"message_type"`
+	ContentType         string               `json:"content_type"`
+	Attachments         []postbackAttachment `json:"attachments,omitempty"`
+	Force               bool                 `json:"force,omitempty"`
 }
 
 // postbackAttachment is a media URL detected in the AI response, sent to the CRM
@@ -115,7 +123,11 @@ func (d *dispatchEngineImpl) Dispatch(
 		default:
 		}
 
-		if err := d.sendPart(ctx, postbackURL, part, nil, terminalHandoff); err != nil {
+		proof := ""
+		if len(parts) == 1 && part == content && len(atts) == 0 {
+			proof = aiModel.ResponseProvenance(ctx)
+		}
+		if err := d.sendPart(ctx, postbackURL, part, nil, terminalHandoff, proof, fmt.Sprint(i)); err != nil {
 			return fmt.Errorf("pipeline.dispatch.send[%d]: %w", i, err)
 		}
 
@@ -142,7 +154,7 @@ func (d *dispatchEngineImpl) Dispatch(
 			return brtErrors.ErrDispatchInterrupted
 		default:
 		}
-		if err := d.sendPart(ctx, postbackURL, "", atts, terminalHandoff); err != nil {
+		if err := d.sendPart(ctx, postbackURL, "", atts, terminalHandoff, "", "media"); err != nil {
 			return fmt.Errorf("pipeline.dispatch.send[media]: %w", err)
 		}
 	}
@@ -159,13 +171,27 @@ func (d *dispatchEngineImpl) Dispatch(
 
 // sendPart sends a single content part (and optional media attachments) to the
 // postback URL.
-func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content string, atts []postbackAttachment, force bool) error {
+func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content string, atts []postbackAttachment, force bool, proof string, segment ...string) error {
+	info := delivery(ctx)
+	if info.guard != nil {
+		if err := info.guard(ctx); err != nil {
+			return err
+		}
+	}
+	deliveryID := ""
+	if info.id != "" && len(segment) > 0 {
+		deliveryID = info.id + ":" + segment[0]
+	}
 	body, err := json.Marshal(postbackRequest{
-		Content:     content,
-		MessageType: "outgoing",
-		ContentType: "text",
-		Attachments: atts,
-		Force:       force,
+		RuntimeDeliveryID:   deliveryID,
+		SourceMessageIDs:    info.sourceMessageIDs,
+		SourceAgentBotID:    info.sourceAgentBotID,
+		Content:             content,
+		KnowledgeProvenance: proof,
+		MessageType:         "outgoing",
+		ContentType:         "text",
+		Attachments:         atts,
+		Force:               force,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -185,6 +211,15 @@ func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content 
 		return fmt.Errorf("do: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		var payload struct {
+			Code string `json:"code"`
+		}
+		err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&payload)
+		if err == nil && payload.Code == "ERR_STALE_TURN" {
+			return ErrStaleTurn
+		}
+	}
 	_, _ = io.Copy(io.Discard, resp.Body) // drain to allow connection reuse
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

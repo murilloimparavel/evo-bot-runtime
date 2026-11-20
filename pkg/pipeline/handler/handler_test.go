@@ -61,12 +61,20 @@ func (m *mockRepo) ScanStates(_ context.Context, _ int) ([]model.PairID, error) 
 func (m *mockRepo) Ping(_ context.Context) error { return m.pingErr }
 
 // mockSvc satisfies pipelineService.PipelineService for handler tests.
-type mockSvc struct{ processErr error }
+type mockSvc struct {
+	processErr    error
+	processCalled bool
+	event         *model.MessageEvent
+}
 
-func (m *mockSvc) Process(_ context.Context, _ *model.MessageEvent) error { return m.processErr }
-func (m *mockSvc) Cancel(_, _ int64) error                                { return nil }
-func (m *mockSvc) Start() error                                           { return nil }
-func (m *mockSvc) Shutdown(_ context.Context)                             {}
+func (m *mockSvc) Process(_ context.Context, event *model.MessageEvent) error {
+	m.event = event
+	m.processCalled = true
+	return m.processErr
+}
+func (m *mockSvc) Cancel(_, _ int64) error    { return nil }
+func (m *mockSvc) Start() error               { return nil }
+func (m *mockSvc) Shutdown(_ context.Context) {}
 
 var _ pipelineService.PipelineService = (*mockSvc)(nil)
 
@@ -103,7 +111,8 @@ func validPayload() []byte {
 
 func TestHandleEvent_202_OnValidRequest(t *testing.T) {
 	mock := &mockRepo{}
-	r := setupRouter(mock, &mockSvc{})
+	svc := &mockSvc{}
+	r := setupRouter(mock, svc)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(validPayload()))
@@ -121,14 +130,17 @@ func TestHandleEvent_202_OnValidRequest(t *testing.T) {
 	if body["status"] != "accepted" {
 		t.Errorf("body.status: got %q, want %q", body["status"], "accepted")
 	}
-	if !mock.setStateCalled {
-		t.Error("StageIncoming state must be persisted before 202 is sent (NFR-01)")
+	if !svc.processCalled {
+		t.Error("durable Process must complete before acceptance")
+	}
+	if mock.setStateCalled {
+		t.Error("handler must not overwrite pipeline state")
 	}
 }
 
 func TestHandleEvent_500_OnSetStateError(t *testing.T) {
 	mock := &mockRepo{setStateErr: errors.New("redis write failed")}
-	r := setupRouter(mock, &mockSvc{})
+	r := setupRouter(mock, &mockSvc{processErr: errors.New("durable commit failed")})
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(validPayload()))
@@ -171,8 +183,8 @@ func TestHandleEvent_400_WhenMessageIDMissing(t *testing.T) {
 	}
 }
 
-func TestHandleEvent_202_EvenWhenProcessFails(t *testing.T) {
-	// Process runs in a goroutine — its errors must not affect the HTTP response.
+func TestHandleEvent_500_WhenDurableCommitFails(t *testing.T) {
+	// Failed durable acceptance must be retryable by the CRM outbox.
 	r := setupRouter(&mockRepo{}, &mockSvc{processErr: errors.New("process error")})
 
 	w := httptest.NewRecorder()
@@ -181,8 +193,8 @@ func TestHandleEvent_202_EvenWhenProcessFails(t *testing.T) {
 	req.Header.Set("X-Bot-Runtime-Secret", testSecret)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusAccepted {
-		t.Errorf("status: got %d, want %d", w.Code, http.StatusAccepted)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status: got %d, want %d", w.Code, http.StatusInternalServerError)
 	}
 }
 
@@ -340,5 +352,36 @@ func TestHealth_503_WhenRedisUnreachable(t *testing.T) {
 	}
 	if body["detail"] != "redis unreachable" {
 		t.Errorf("body.detail: got %q, want %q", body["detail"], "redis unreachable")
+	}
+}
+
+func TestHandleEvent_BlockedConversationHasSpecificResponse(t *testing.T) {
+	for _, cause := range []error{repository.ErrLegacyTurnPending, repository.ErrTurnQuarantined} {
+		r := setupRouter(&mockRepo{}, &mockSvc{processErr: cause})
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(validPayload()))
+		req.Header.Set("X-Bot-Runtime-Secret", testSecret)
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusConflict || !bytes.Contains(w.Body.Bytes(), []byte("ERR_TURN_BLOCKED")) {
+			t.Fatalf("unexpected response: %d %s", w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestHandleEvent_PreservesLargeMetadataNumber(t *testing.T) {
+	svc := &mockSvc{}
+	r := setupRouter(&mockRepo{}, svc)
+	var payload map[string]any
+	if err := json.Unmarshal(validPayload(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	payload["metadata"] = map[string]any{"large": json.Number("979840692712911069")}
+	body, _ := json.Marshal(payload)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(body))
+	req.Header.Set("X-Bot-Runtime-Secret", testSecret)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted || svc.event.Metadata["large"] != json.Number("979840692712911069") {
+		t.Fatal("metadata precision lost")
 	}
 }
