@@ -2,12 +2,16 @@ package repository_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/EvolutionAPI/evo-bot-runtime/internal/testhelpers"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/model"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/repository"
+	"github.com/redis/go-redis/v9"
 )
 
 func durableRepo(t *testing.T) repository.DurableRepository {
@@ -31,7 +35,7 @@ func TestDurableAcceptDeduplicatesAndRetainsCompleteEvents(t *testing.T) {
 	if err := r.AcceptEvent(ctx, e); err != nil {
 		t.Fatal(err)
 	}
-	turn, err := r.ClaimTurn(ctx, fmt.Sprintf("bot_runtime:durable:%d:%d", c, c), "owner", time.Second)
+	turn, err := r.ClaimTurn(ctx, fmt.Sprintf("bot_runtime:durable:v2:%d:%d", c, c), "owner", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +67,7 @@ func TestDurableNewEventFencesOldOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The key contains only numeric tenant-independent identifiers, never content.
-	old, err := r.ClaimTurn(ctx, fmt.Sprintf("bot_runtime:durable:%d:%d", c, c), "old", time.Second)
+	old, err := r.ClaimTurn(ctx, fmt.Sprintf("bot_runtime:durable:v2:%d:%d", c, c), "old", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +110,7 @@ func TestDurableExpiredLeaseRecoversSavedResponse(t *testing.T) {
 	if err := r.AcceptEvent(ctx, e); err != nil {
 		t.Fatal(err)
 	}
-	first, err := r.ClaimTurn(ctx, fmt.Sprintf("bot_runtime:durable:%d:%d", c, c), "crashed", time.Second)
+	first, err := r.ClaimTurn(ctx, fmt.Sprintf("bot_runtime:durable:v2:%d:%d", c, c), "crashed", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,5 +139,161 @@ func TestDurableExpiredLeaseRecoversSavedResponse(t *testing.T) {
 	}
 	if ok, _ := r.CompleteTurn(ctx, first); ok {
 		t.Fatal("old token cleaned recovered turn")
+	}
+}
+
+func TestDurableRoundTripPreservesLargeContactID(t *testing.T) {
+	const contactID int64 = 979840692712911069
+	const conversationID int64 = 4746
+	r := durableRepo(t)
+	ctx := context.Background()
+	e := eventFor(contactID, fmt.Sprintf("large-%d", time.Now().UnixNano()), "hello")
+	e.ConversationID = conversationID
+	e.Metadata = map[string]any{"large": json.Number("979840692712911069")}
+	defer r.CancelTurn(ctx, contactID, conversationID)
+	if err := r.AcceptEvent(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := r.ClaimTurn(ctx, fmt.Sprintf("bot_runtime:durable:v2:%d:%d", contactID, conversationID), "large-owner", time.Second)
+	if err != nil || turn == nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(turn.Events) != 1 || turn.Events[0].ContactID != contactID || turn.Events[0].Metadata["large"] != json.Number("979840692712911069") {
+		t.Fatal("contact identity changed")
+	}
+	if ok, err := r.CompleteTurn(ctx, turn); err != nil || !ok {
+		t.Fatalf("complete: %v %v", ok, err)
+	}
+}
+
+func TestLegacyPendingTurnBlocksNewEventsWithoutChangingOldData(t *testing.T) {
+	r := durableRepo(t)
+	ctx := context.Background()
+	c := time.Now().UnixNano() % 1000000000000
+	e := eventFor(c, "legacy-block", "new message")
+	client := redis.NewClient(testhelpers.RedisOptions())
+	defer client.Close()
+	legacyKey := fmt.Sprintf("bot_runtime:durable:%d:%d", c, c)
+	defer client.Del(ctx, legacyKey)
+	if err := client.Set(ctx, legacyKey, "legacy-data", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.AcceptEvent(ctx, e); !errors.Is(err, repository.ErrLegacyTurnPending) {
+		t.Fatalf("expected legacy block, got %v", err)
+	}
+	if got := client.Get(ctx, legacyKey).Val(); got != "legacy-data" {
+		t.Fatal("legacy turn changed")
+	}
+	if n := client.Exists(ctx, fmt.Sprintf("bot_runtime:durable:v2:%d:%d", c, c)).Val(); n != 0 {
+		t.Fatal("new turn created")
+	}
+}
+
+func TestCorruptTurnIsQuarantinedWithoutDiscardingPayload(t *testing.T) {
+	r := durableRepo(t)
+	ctx := context.Background()
+	c := time.Now().UnixNano() % 1000000000000
+	client := redis.NewClient(testhelpers.RedisOptions())
+	defer client.Close()
+	key := fmt.Sprintf("bot_runtime:durable:v2:%d:%d", c, c)
+	defer client.Del(ctx, key, key+":lease")
+	defer client.ZRem(ctx, "bot_runtime:durable:v2:quarantine", key)
+	defer client.ZRem(ctx, "bot_runtime:durable:v2:ready", key)
+	if err := client.Set(ctx, key, "{bad-json", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ZAdd(ctx, "bot_runtime:durable:v2:ready", redis.Z{Score: 0, Member: key}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if turn, err := r.ClaimTurn(ctx, key, "owner", time.Second); err == nil || turn != nil {
+		t.Fatal("invalid turn accepted")
+	}
+	if got := client.Get(ctx, key).Val(); got != "{bad-json" {
+		t.Fatal("quarantined payload lost")
+	}
+	if err := client.ZScore(ctx, "bot_runtime:durable:v2:quarantine", key).Err(); err != nil {
+		t.Fatal("turn not quarantined")
+	}
+	if err := r.AcceptEvent(ctx, eventFor(c, "after-quarantine", "new message")); !errors.Is(err, repository.ErrTurnQuarantined) {
+		t.Fatalf("expected quarantine block, got %v", err)
+	}
+}
+
+func TestMissingAttemptsIsQuarantinedBeforeLease(t *testing.T) {
+	r := durableRepo(t)
+	ctx := context.Background()
+	c := time.Now().UnixNano() % 1000000000000
+	client := redis.NewClient(testhelpers.RedisOptions())
+	defer client.Close()
+	key := fmt.Sprintf("bot_runtime:durable:v2:%d:%d", c, c)
+	defer client.Del(ctx, key, key+":lease")
+	defer client.ZRem(ctx, "bot_runtime:durable:v2:quarantine", key)
+	raw := fmt.Sprintf(`{"key":%q,"events":[],"revision":1,"due_at":0}`, key)
+	if err := client.Set(ctx, key, raw, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ZAdd(ctx, "bot_runtime:durable:v2:ready", redis.Z{Score: 0, Member: key}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ClaimTurn(ctx, key, "owner", time.Second); err == nil {
+		t.Fatal("invalid turn accepted")
+	}
+	if client.Exists(ctx, key+":lease").Val() != 0 {
+		t.Fatal("invalid turn acquired lease")
+	}
+	if client.Get(ctx, key).Val() != raw {
+		t.Fatal("payload changed")
+	}
+	if err := client.ZScore(ctx, "bot_runtime:durable:v2:quarantine", key).Err(); err != nil {
+		t.Fatal("turn not quarantined")
+	}
+}
+
+func TestCorruptTurnWithActiveOwnerIsNotQuarantinedByAnotherWorker(t *testing.T) {
+	r := durableRepo(t)
+	ctx := context.Background()
+	c := time.Now().UnixNano() % 1000000000000
+	client := redis.NewClient(testhelpers.RedisOptions())
+	defer client.Close()
+	key := fmt.Sprintf("bot_runtime:durable:v2:%d:%d", c, c)
+	defer client.Del(ctx, key, key+":lease")
+	defer client.ZRem(ctx, "bot_runtime:durable:v2:ready", key)
+	defer client.ZRem(ctx, "bot_runtime:durable:v2:quarantine", key)
+	if err := client.Set(ctx, key, "{bad-json", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set(ctx, key+":lease", "active-owner", time.Second).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if turn, err := r.ClaimTurn(ctx, key, "other", time.Second); err != nil || turn != nil {
+		t.Fatalf("active owner was disturbed: %v", err)
+	}
+	if err := client.ZScore(ctx, "bot_runtime:durable:v2:quarantine", key).Err(); err != redis.Nil {
+		t.Fatal("active turn quarantined")
+	}
+	if client.Get(ctx, key+":lease").Val() != "active-owner" {
+		t.Fatal("active lease changed")
+	}
+}
+
+func TestExpiredLeaseCannotSaveOrComplete(t *testing.T) {
+	c := time.Now().UnixNano() % 1000000000000
+	r := durableRepo(t)
+	ctx := context.Background()
+	e := eventFor(c, "expired", "hello")
+	defer r.CancelTurn(ctx, c, c)
+	if err := r.AcceptEvent(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	turn, err := r.ClaimTurn(ctx, fmt.Sprintf("bot_runtime:durable:v2:%d:%d", c, c), "old", 20*time.Millisecond)
+	if err != nil || turn == nil {
+		t.Fatal("missing turn", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if ok, err := r.SaveTurnResult(ctx, turn, "response", "", false); err != nil || ok {
+		t.Fatalf("expired owner saved: %v %v", ok, err)
+	}
+	if ok, err := r.CompleteTurn(ctx, turn); err != nil || ok {
+		t.Fatalf("expired owner completed: %v %v", ok, err)
 	}
 }

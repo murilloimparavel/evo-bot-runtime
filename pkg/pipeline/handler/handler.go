@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -39,7 +41,9 @@ func (h *Handler) handleHealth(c *gin.Context) {
 
 func (h *Handler) handleEvent(c *gin.Context) {
 	var event model.MessageEvent
-	if err := c.ShouldBindJSON(&event); err != nil {
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&event); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "invalid payload",
 			"code":  "ERR_INVALID_EVENT",
@@ -57,6 +61,11 @@ func (h *Handler) handleEvent(c *gin.Context) {
 	// Process commits the complete event atomically before returning. A 5xx
 	// permits the CRM outbox to retry the original message ID safely.
 	if err := h.svc.Process(c.Request.Context(), &event); err != nil {
+		if errors.Is(err, repository.ErrLegacyTurnPending) || errors.Is(err, repository.ErrTurnQuarantined) {
+			slog.Warn("pipeline.event.reconciliation_required", "conversation_id", event.ConversationID, "reason", err.Error())
+			c.JSON(http.StatusConflict, gin.H{"error": "conversation requires reconciliation", "code": "ERR_TURN_BLOCKED"})
+			return
+		}
 		slog.Error("pipeline.event.persist_failed", "contact_id", event.ContactID, "conversation_id", event.ConversationID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error", "code": "ERR_INTERNAL"})
 		return

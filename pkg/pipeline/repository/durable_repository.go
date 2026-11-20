@@ -1,10 +1,12 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -41,10 +43,15 @@ type DurableRepository interface {
 	CancelTurn(context.Context, int64, int64) error
 }
 
-const readyTurnsKey = "bot_runtime:durable:ready"
+const readyTurnsKey = "bot_runtime:durable:v2:ready"
+const quarantineTurnsKey = "bot_runtime:durable:v2:quarantine"
+
+// ErrLegacyTurnPending prevents new work from bypassing an unreconciled v1 turn.
+var ErrLegacyTurnPending = errors.New("legacy durable turn requires reconciliation")
+var ErrTurnQuarantined = errors.New("durable turn requires quarantine review")
 
 func durableKey(contactID, conversationID int64) string {
-	return fmt.Sprintf("bot_runtime:durable:%d:%d", contactID, conversationID)
+	return fmt.Sprintf("bot_runtime:durable:v2:%d:%d", contactID, conversationID)
 }
 func (r *redisPipelineRepository) AcceptEvent(ctx context.Context, e *model.MessageEvent) error {
 	raw, err := json.Marshal(e)
@@ -54,20 +61,34 @@ func (r *redisPipelineRepository) AcceptEvent(ctx context.Context, e *model.Mess
 	key := durableKey(e.ContactID, e.ConversationID)
 	digest := sha256.Sum256([]byte(e.AgentBotID + "\x00" + e.MessageID))
 	receipt := key + ":receipt:" + hex.EncodeToString(digest[:])
+	legacyKey := fmt.Sprintf("bot_runtime:durable:%d:%d", e.ContactID, e.ConversationID)
+	legacyReceipt := legacyKey + ":receipt:" + hex.EncodeToString(digest[:])
 	// Receipt and payload are committed together; no acceptance marker can exist
 	// without its corresponding recoverable event. No TTL on unfinished work.
-	_, err = r.rdb.Eval(ctx, `
+	result, err := r.rdb.Eval(ctx, `
+ if redis.call('EXISTS',KEYS[4]) == 1 then return -1 end
+ if redis.call('ZSCORE',KEYS[5],KEYS[1]) then return -2 end
+ if redis.call('EXISTS',KEYS[6]) == 1 then return -1 end
  if redis.call('EXISTS',KEYS[2]) == 1 then return 0 end
  local raw=redis.call('GET',KEYS[1]); local t
  if raw then t=cjson.decode(raw) else t={key=KEYS[1],revision=0,events={}} end
- table.insert(t.events,cjson.decode(ARGV[1])); t.revision=t.revision+1
+ table.insert(t.events,ARGV[1]); t.revision=t.revision+1
  t.phase='waiting'; t.token=''; t.due_at=tonumber(ARGV[2]); t.attempts=0
  t.content=nil; t.provenance=nil; t.terminal_handoff=nil; t.failure_notified=nil
  redis.call('SET',KEYS[1],cjson.encode(t))
  redis.call('SET',KEYS[2],'1')
  redis.call('ZADD',KEYS[3],ARGV[2],KEYS[1]); return 1
- `, []string{key, receipt, readyTurnsKey}, raw, time.Now().Add(time.Duration(e.BotConfig.DebounceTime)*time.Second).UnixMilli()).Result()
-	return err
+ `, []string{key, receipt, readyTurnsKey, legacyKey, quarantineTurnsKey, legacyReceipt}, raw, time.Now().Add(time.Duration(e.BotConfig.DebounceTime)*time.Second).UnixMilli()).Int()
+	if err != nil {
+		return err
+	}
+	if result == -1 {
+		return ErrLegacyTurnPending
+	}
+	if result == -2 {
+		return ErrTurnQuarantined
+	}
+	return nil
 }
 func (r *redisPipelineRepository) ReadyTurns(ctx context.Context, limit int) ([]string, error) {
 	return r.rdb.ZRangeByScore(ctx, readyTurnsKey, &redis.ZRangeBy{Min: "-inf", Max: fmt.Sprint(time.Now().UnixMilli()), Offset: 0, Count: int64(limit)}).Result()
@@ -75,24 +96,81 @@ func (r *redisPipelineRepository) ReadyTurns(ctx context.Context, limit int) ([]
 func (r *redisPipelineRepository) ClaimTurn(ctx context.Context, key, token string, lease time.Duration) (*DurableTurn, error) {
 	raw, err := r.rdb.Eval(ctx, `
  local raw=redis.call('GET',KEYS[1]); if not raw then redis.call('ZREM',KEYS[2],KEYS[1]); return '' end
- local t=cjson.decode(raw); if t.due_at>tonumber(ARGV[1]) then return '' end
+ if redis.call('EXISTS',KEYS[3]) == 1 then
+   redis.call('ZADD',KEYS[2],tonumber(ARGV[1])+math.max(1,redis.call('PTTL',KEYS[3])),KEYS[1]); return ''
+ end
+ local ok,t=pcall(cjson.decode,raw)
+ if not ok or type(t) ~= 'table' or type(t.due_at) ~= 'number' or type(t.attempts) ~= 'number' or type(t.revision) ~= 'number' or type(t.events) ~= 'table' then
+   redis.call('ZREM',KEYS[2],KEYS[1]); redis.call('ZADD',KEYS[4],ARGV[1],KEYS[1]); return '__INVALID_TURN__'
+ end
+ if t.due_at>tonumber(ARGV[1]) then return '' end
  if not redis.call('SET',KEYS[3],ARGV[2],'NX','PX',ARGV[4]) then
  redis.call('ZADD',KEYS[2],tonumber(ARGV[1])+math.max(1,redis.call('PTTL',KEYS[3])),KEYS[1]); return '' end
  t.token=ARGV[2]; t.due_at=tonumber(ARGV[3]); t.attempts=t.attempts+1
  redis.call('SET',KEYS[1],cjson.encode(t)); redis.call('ZADD',KEYS[2],ARGV[3],KEYS[1]); return cjson.encode(t)
- `, []string{key, readyTurnsKey, key + ":lease"}, time.Now().UnixMilli(), token, time.Now().Add(lease).UnixMilli(), lease.Milliseconds()).Text()
+ `, []string{key, readyTurnsKey, key + ":lease", quarantineTurnsKey}, time.Now().UnixMilli(), token, time.Now().Add(lease).UnixMilli(), lease.Milliseconds()).Text()
 	if err != nil {
 		return nil, err
 	}
 	if raw == "" {
 		return nil, nil
 	}
+	if raw == "__INVALID_TURN__" {
+		return nil, errors.New("invalid durable turn quarantined")
+	}
 	var t DurableTurn
-	err = json.Unmarshal([]byte(raw), &t)
-	return &t, err
+	var stored struct {
+		*DurableTurn
+		Events []string `json:"events"`
+	}
+	stored.DurableTurn = &t
+	if err = json.Unmarshal([]byte(raw), &stored); err == nil {
+		for _, event := range stored.Events {
+			var decoded model.MessageEvent
+			decoder := json.NewDecoder(bytes.NewBufferString(event))
+			decoder.UseNumber()
+			if err = decoder.Decode(&decoded); err != nil {
+				break
+			}
+			if err = decoded.Validate(); err != nil {
+				break
+			}
+			if durableKey(decoded.ContactID, decoded.ConversationID) != key {
+				err = errors.New("event identity does not match turn")
+				break
+			}
+			t.Events = append(t.Events, decoded)
+		}
+		if err == nil && (t.Key != key || len(t.Events) == 0) {
+			err = errors.New("invalid durable turn")
+		}
+	}
+	if err != nil {
+		// Preserve the payload and receipts. Only the current lease owner may
+		// remove this malformed turn from the ready queue.
+		quarantined, quarantineErr := r.rdb.Eval(ctx, `
+ if redis.call('GET',KEYS[2]) ~= ARGV[1] then return 0 end
+ local raw=redis.call('GET',KEYS[1]); if not raw then redis.call('DEL',KEYS[2]); return 0 end
+ local ok,current=pcall(cjson.decode,raw)
+ if not ok or type(current) ~= 'table' or current.token ~= ARGV[1] then
+   redis.call('DEL',KEYS[2]); return 0
+ end
+ redis.call('ZREM',KEYS[3],KEYS[1]); redis.call('DEL',KEYS[2])
+ redis.call('ZADD',KEYS[4],ARGV[2],KEYS[1]); return 1
+ `, []string{key, key + ":lease", readyTurnsKey, quarantineTurnsKey}, token, time.Now().UnixMilli()).Int()
+		if quarantineErr != nil {
+			return nil, fmt.Errorf("invalid durable turn; quarantine failed: %w", quarantineErr)
+		}
+		if quarantined == 0 {
+			return nil, errors.New("invalid durable turn changed before quarantine")
+		}
+		return nil, errors.New("invalid durable turn quarantined")
+	}
+	return &t, nil
 }
 
 const guardTurn = `
+ if redis.call('GET',KEYS[3])~=ARGV[2] then return 0 end
  local raw=redis.call('GET',KEYS[1]); if not raw then return 0 end
  local t=cjson.decode(raw)
  if t.revision~=tonumber(ARGV[1]) or t.token~=ARGV[2] then return 0 end
@@ -111,19 +189,19 @@ func (r *redisPipelineRepository) SaveTurnResult(ctx context.Context, t *Durable
 	n, err := r.rdb.Eval(ctx, guardTurn+`
  t.phase='dispatch'; t.content=ARGV[3]; t.provenance=ARGV[4]; t.terminal_handoff=(ARGV[5]=='true')
  redis.call('SET',KEYS[1],cjson.encode(t)); return 1
- `, []string{t.Key}, t.Revision, t.Token, content, proof, fmt.Sprint(terminal)).Int()
+ `, []string{t.Key, readyTurnsKey, t.Key + ":lease"}, t.Revision, t.Token, content, proof, fmt.Sprint(terminal)).Int()
 	return n == 1, err
 }
 func (r *redisPipelineRepository) RetryTurn(ctx context.Context, t *DurableTurn, delay time.Duration) error {
 	_, err := r.rdb.Eval(ctx, guardTurn+`
  t.due_at=tonumber(ARGV[3]); t.token=''; redis.call('SET',KEYS[1],cjson.encode(t)); redis.call('ZADD',KEYS[2],ARGV[3],KEYS[1]); return 1
- `, []string{t.Key, readyTurnsKey}, t.Revision, t.Token, time.Now().Add(delay).UnixMilli()).Result()
+ `, []string{t.Key, readyTurnsKey, t.Key + ":lease"}, t.Revision, t.Token, time.Now().Add(delay).UnixMilli()).Result()
 	return err
 }
 func (r *redisPipelineRepository) CompleteTurn(ctx context.Context, t *DurableTurn) (bool, error) {
 	n, err := r.rdb.Eval(ctx, guardTurn+`
  redis.call('DEL',KEYS[1]); redis.call('ZREM',KEYS[2],KEYS[1]); return 1
- `, []string{t.Key, readyTurnsKey}, t.Revision, t.Token).Int()
+ `, []string{t.Key, readyTurnsKey, t.Key + ":lease"}, t.Revision, t.Token).Int()
 	return n == 1, err
 }
 func (r *redisPipelineRepository) CancelTurn(ctx context.Context, cid, vid int64) error {
@@ -140,6 +218,6 @@ func (r *redisPipelineRepository) ReleaseTurn(ctx context.Context, t *DurableTur
 }
 
 func (r *redisPipelineRepository) MarkTurnNotified(ctx context.Context, t *DurableTurn) error {
-	_, err := r.rdb.Eval(ctx, guardTurn+`t.failure_notified=true;redis.call('SET',KEYS[1],cjson.encode(t));return 1`, []string{t.Key}, t.Revision, t.Token).Result()
+	_, err := r.rdb.Eval(ctx, guardTurn+`t.failure_notified=true;redis.call('SET',KEYS[1],cjson.encode(t));return 1`, []string{t.Key, readyTurnsKey, t.Key + ":lease"}, t.Revision, t.Token).Result()
 	return err
 }

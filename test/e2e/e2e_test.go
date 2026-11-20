@@ -324,6 +324,25 @@ func TestE2E_FullHappyPath(t *testing.T) {
 	}
 }
 
+func TestE2E_LargeContactID(t *testing.T) {
+	h := newHarness(t)
+	_, convID := nextPair()
+	const contactID int64 = 979840692712911069
+	h.aiServer.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(a2aResponse("large ID response")) //nolint:errcheck
+	})
+	resp := h.postEvent(t, h.event(contactID, convID, "hello", 0))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", resp.StatusCode)
+	}
+	h.pbServer.waitForCall(t, 3*time.Second)
+	if got := decodePostbackContent(h.pbServer.lastBody()); got != "large ID response" {
+		t.Fatalf("unexpected response: %q", got)
+	}
+}
+
 // TestE2E_DebounceAggregation verifies that two events within the debounce window
 // are concatenated with \n\n and reach the AI as a single aggregated message.
 // pipeline_service_test.go verifies state transitions but never checks the content
@@ -585,7 +604,7 @@ func TestE2E_PipelineIsolation(t *testing.T) {
 	}
 
 	// Pair A remains durably pending for retry; pair B's success is independent.
-	stateKey := fmt.Sprintf("bot_runtime:durable:%d:%d", pairAContact, pairAConv)
+	stateKey := fmt.Sprintf("bot_runtime:durable:v2:%d:%d", pairAContact, pairAConv)
 	if h.rdb.Exists(context.Background(), stateKey).Val() != 1 {
 		t.Error("failed pair A lost recoverable work")
 	}

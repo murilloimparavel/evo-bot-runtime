@@ -64,9 +64,11 @@ func (m *mockRepo) Ping(_ context.Context) error { return m.pingErr }
 type mockSvc struct {
 	processErr    error
 	processCalled bool
+	event         *model.MessageEvent
 }
 
-func (m *mockSvc) Process(_ context.Context, _ *model.MessageEvent) error {
+func (m *mockSvc) Process(_ context.Context, event *model.MessageEvent) error {
+	m.event = event
 	m.processCalled = true
 	return m.processErr
 }
@@ -350,5 +352,36 @@ func TestHealth_503_WhenRedisUnreachable(t *testing.T) {
 	}
 	if body["detail"] != "redis unreachable" {
 		t.Errorf("body.detail: got %q, want %q", body["detail"], "redis unreachable")
+	}
+}
+
+func TestHandleEvent_BlockedConversationHasSpecificResponse(t *testing.T) {
+	for _, cause := range []error{repository.ErrLegacyTurnPending, repository.ErrTurnQuarantined} {
+		r := setupRouter(&mockRepo{}, &mockSvc{processErr: cause})
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(validPayload()))
+		req.Header.Set("X-Bot-Runtime-Secret", testSecret)
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusConflict || !bytes.Contains(w.Body.Bytes(), []byte("ERR_TURN_BLOCKED")) {
+			t.Fatalf("unexpected response: %d %s", w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestHandleEvent_PreservesLargeMetadataNumber(t *testing.T) {
+	svc := &mockSvc{}
+	r := setupRouter(&mockRepo{}, svc)
+	var payload map[string]any
+	if err := json.Unmarshal(validPayload(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	payload["metadata"] = map[string]any{"large": json.Number("979840692712911069")}
+	body, _ := json.Marshal(payload)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(body))
+	req.Header.Set("X-Bot-Runtime-Secret", testSecret)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted || svc.event.Metadata["large"] != json.Number("979840692712911069") {
+		t.Fatal("metadata precision lost")
 	}
 }

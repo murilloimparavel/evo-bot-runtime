@@ -369,3 +369,28 @@ func TestDispatchDeliveryIDsAreStableAndGuardStopsStaleSegments(t *testing.T) {
 		t.Fatalf("stale segment sent: %v", ids)
 	}
 }
+
+func TestDispatchStaleHandoffSendsSourceIDsAndStops(t *testing.T) {
+	var received struct {
+		IDs     []string `json:"source_message_ids"`
+		AgentID string   `json:"source_agent_bot_id"`
+		Force   bool     `json:"force"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"code":"ERR_STALE_TURN"}`))
+	}))
+	defer server.Close()
+	ctx := service.WithDelivery(context.Background(), "batch", func(context.Context) error { return nil })
+	ctx = service.WithSourceMessages(ctx, []string{"source-1", "source-2"}, "original-bot")
+	err := service.NewDispatchEngine("").Dispatch(ctx, 1, 1, "handoff", model.BotConfig{}, true, server.URL)
+	if !errors.Is(err, service.ErrStaleTurn) {
+		t.Fatalf("expected stale turn, got %v", err)
+	}
+	if !received.Force || received.AgentID != "original-bot" || len(received.IDs) != 2 || received.IDs[0] != "source-1" || received.IDs[1] != "source-2" {
+		t.Fatalf("incorrect source contract: %+v", received)
+	}
+}

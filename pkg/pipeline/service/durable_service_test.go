@@ -9,6 +9,7 @@ import (
 	"time"
 
 	aiModel "github.com/EvolutionAPI/evo-bot-runtime/pkg/ai/model"
+	dispatchIface "github.com/EvolutionAPI/evo-bot-runtime/pkg/dispatch/service"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/model"
 	"github.com/EvolutionAPI/evo-bot-runtime/pkg/pipeline/repository"
 )
@@ -196,5 +197,36 @@ func TestDurableProductionConstructorRejectsUndrainedLegacyWork(t *testing.T) {
 	defer production.Shutdown(ctx)
 	if err := production.Start(); err == nil || !strings.Contains(err.Error(), "drain legacy") {
 		t.Fatalf("unsafe cutover accepted: %v", err)
+	}
+}
+
+func TestDurableStaleHandoffDoesNotRetry(t *testing.T) {
+	c := time.Now().UnixNano() % 1000000000000
+	var calls atomic.Int32
+	ai := &mockAIAdapter{callFn: func(_ context.Context, _ *aiModel.A2ARequest) (*aiModel.NormalizedResponse, error) {
+		return &aiModel.NormalizedResponse{Content: "handoff", TerminalHandoff: true}, nil
+	}}
+	dispatched := make(chan struct{}, 1)
+	d := &mockDispatchEngine{dispatchFn: func(_ context.Context, _, _ int64, _ string, _ model.BotConfig, _ bool, _ string) error {
+		calls.Add(1)
+		dispatched <- struct{}{}
+		return dispatchIface.ErrStaleTurn
+	}}
+	svc, repo := testDurableSvc(t, ai, d)
+	defer repo.CancelTurn(context.Background(), c, c)
+	if err := svc.Process(context.Background(), durableEvent(c, "stale-handoff", "help")); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-dispatched:
+	case <-time.After(3 * time.Second):
+		t.Fatal("not dispatched")
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if calls.Load() != 1 {
+		t.Fatalf("stale handoff retried %d times", calls.Load())
 	}
 }

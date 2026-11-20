@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -95,7 +97,13 @@ func (s *durableService) poll() {
 			claimCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 			t, err := s.repo.ClaimTurn(claimCtx, key, hex.EncodeToString(tokenBytes), turnLease)
 			cancel()
-			if err != nil || t == nil {
+			if err != nil {
+				digest := sha256.Sum256([]byte(key))
+				slog.Error("pipeline.turn.claim_failed", "turn_fingerprint", hex.EncodeToString(digest[:8]), "error", err)
+				<-s.slots
+				continue
+			}
+			if t == nil {
 				<-s.slots
 				continue
 			}
@@ -132,6 +140,7 @@ func (s *durableService) run(t *repository.DurableTurn) {
 				current, err := s.repo.RenewTurn(c, t, turnLease)
 				done()
 				if err != nil {
+					slog.Error("pipeline.turn.lease_renew_failed", "revision", t.Revision)
 					cancel()
 					return
 				}
@@ -182,6 +191,7 @@ func (s *durableService) run(t *repository.DurableTurn) {
 		ok, err := s.repo.SaveTurnResult(c, t, content, response.KnowledgeProvenance, response.TerminalHandoff)
 		done()
 		if err != nil {
+			slog.Error("pipeline.turn.result_save_failed", "conversation_id", last.ConversationID, "revision", t.Revision)
 			s.retry(t)
 			return
 		}
@@ -203,7 +213,21 @@ func (s *durableService) run(t *repository.DurableTurn) {
 		}
 		return nil
 	})
+	if t.TerminalHandoff {
+		dispatchCtx = dispatchIface.WithSourceMessages(dispatchCtx, ids, last.AgentBotID)
+	}
 	if err := s.dispatch.Dispatch(dispatchCtx, last.ContactID, last.ConversationID, t.Content, last.BotConfig, t.TerminalHandoff, last.PostbackURL); err != nil {
+		if errors.Is(err, dispatchIface.ErrStaleTurn) {
+			slog.Info("pipeline.turn.stale_handoff_discarded", "conversation_id", last.ConversationID, "revision", t.Revision)
+			c, done := cleanupCtx()
+			_, completeErr := s.repo.CompleteTurn(c, t)
+			done()
+			if completeErr != nil {
+				s.retry(t)
+			}
+			return
+		}
+		slog.Warn("pipeline.turn.dispatch_failed", "conversation_id", last.ConversationID, "revision", t.Revision, "attempt", t.Attempts)
 		s.retry(t)
 		return
 	}

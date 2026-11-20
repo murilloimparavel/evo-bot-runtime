@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -33,8 +34,12 @@ type DispatchEngine interface {
 	) error
 }
 
+var ErrStaleTurn = errors.New("CRM rejected stale turn")
+
 // postbackRequest is the JSON body for each HTTP POST to the postback endpoint.
 type postbackRequest struct {
+	SourceAgentBotID    string               `json:"source_agent_bot_id,omitempty"`
+	SourceMessageIDs    []string             `json:"source_message_ids,omitempty"`
 	RuntimeDeliveryID   string               `json:"runtime_delivery_id,omitempty"`
 	Content             string               `json:"content"`
 	KnowledgeProvenance string               `json:"knowledge_provenance,omitempty"`
@@ -179,6 +184,8 @@ func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content 
 	}
 	body, err := json.Marshal(postbackRequest{
 		RuntimeDeliveryID:   deliveryID,
+		SourceMessageIDs:    info.sourceMessageIDs,
+		SourceAgentBotID:    info.sourceAgentBotID,
 		Content:             content,
 		KnowledgeProvenance: proof,
 		MessageType:         "outgoing",
@@ -204,6 +211,15 @@ func (d *dispatchEngineImpl) sendPart(ctx context.Context, postbackURL, content 
 		return fmt.Errorf("do: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		var payload struct {
+			Code string `json:"code"`
+		}
+		err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&payload)
+		if err == nil && payload.Code == "ERR_STALE_TURN" {
+			return ErrStaleTurn
+		}
+	}
 	_, _ = io.Copy(io.Discard, resp.Body) // drain to allow connection reuse
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
